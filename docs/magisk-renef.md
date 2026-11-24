@@ -142,5 +142,5 @@ FORCE_RELEASE=1 uv run python3 main.py
 ## Source & Credits
 
 - **magisk-renef** — [github.com/vichhka-git/magisk-renef](https://github.com/vichhka-git/magisk-renef)
-- **Renef** — [github.com/Ahmeth4n/renef](https://github.com/Ahmeth4n/renef) by Ahmeth4n
+- **Renef** — [github.com/Byterialab/renef](https://github.com/Byterialab/renef) by Ahmeth4n
 - Inspired by [magisk-frida](https://github.com/ViRb3/magisk-frida) by ViRb3

@@ -261,6 +261,81 @@ end
 
 ---
 
+## Allocation Functions
+
+### `Memory.alloc(size, [prot])`
+
+Allocate a fresh anonymous memory region and return its base address. The kernel
+rounds the size up to whole pages. Useful for building structs or buffers to feed
+back into hooks or `Java` calls.
+
+`prot` is an optional protection string of `r`/`w`/`x` characters (e.g. `"rwx"`,
+`"r-x"`). It defaults to `"rw-"` (read/write).
+
+```lua
+-- 64-byte read/write scratch buffer
+local p = Memory.alloc(64)
+Memory.writeU32(p, 0xDEADBEEF)
+
+-- Executable scratch page (e.g. for generated code)
+local code = Memory.alloc(0x1000, "rwx")
+```
+
+**Returns:** `address` (integer) on success, or `nil, error_message` on failure
+
+---
+
+### `Memory.protect(address, size, prot)`
+
+Change page protection on an existing region. `prot` is a string of `r`/`w`/`x`
+characters. The range is expanded to page boundaries (same as `Memory.patch`).
+
+```lua
+-- Make a code page writable before patching, then restore
+Memory.protect(addr, 0x1000, "rwx")
+Memory.writeU32(addr, 0xD503201F)  -- ARM64 NOP
+Memory.protect(addr, 0x1000, "r-x")
+```
+
+**Returns:** `true` on success, or `false, error_message` on failure
+
+---
+
+### `Memory.allocStr(str)`
+
+Allocate a read/write region, copy a NUL-terminated string into it, and return
+its base address. A shortcut for `Memory.alloc` + `Memory.write` when you need to
+hand a string to a hook, native call, or `Java` method.
+
+```lua
+local path = Memory.allocStr("/system/bin/sh")
+-- ... pass `path` as a char* argument ...
+Memory.free(path)
+```
+
+**Returns:** `address` (integer) on success, or `nil, error_message` on failure
+
+---
+
+### `Memory.free(address, [size])`
+
+Release a region previously returned by `Memory.alloc` or `Memory.allocStr`. The
+size is looked up automatically from an internal allocation registry, so you
+normally pass only the address. Provide an explicit `size` only for regions the
+registry no longer tracks or ones you mapped yourself.
+
+```lua
+local p = Memory.alloc(64)
+-- ...
+Memory.free(p)          -- size resolved automatically
+
+Memory.free(other, 0x1000)  -- explicit size
+```
+
+**Returns:** `true` on success, or `false, error_message` on failure
+
+---
+
 ## Examples
 
 ### Find and patch function

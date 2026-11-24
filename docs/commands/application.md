@@ -9,7 +9,12 @@ nav_order: 2
 
 ## `la [~filter]`
 
-List installed applications on device. Supports filtering with `~` operator.
+List installed applications on the device. Supports filtering with the `~` operator.
+
+**No target required.** Like `frida-ps -Uai`, `la` queries the device's package
+manager directly through `renef_server` — you do **not** need to spawn or attach
+to an app first. It works as soon as the server is running and the client is
+connected.
 
 ```bash
 # List all apps
@@ -24,8 +29,10 @@ la~com.example
 
 **Output:**
 ```
-package:com.google.android.gms
-package:com.google.android.gsf
-package:com.google.android.telephony.satellite
-package:com.android.vending
+com.google.android.gms
+com.google.android.gsf
+com.google.android.telephony.satellite
+com.android.vending
+
+Total: 4 packages
 ```

@@ -18,7 +18,7 @@ nav_order: 4
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/ahmeth4n/renef.git
+git clone https://github.com/Byterialab/renef.git
 cd renef
 
 # 2. Setup dependencies (Lua + Capstone)
@@ -54,6 +54,12 @@ adb shell /data/local/tmp/renef_server
 | `make setup` | Setup Lua and Capstone dependencies |
 | `make client-android` | Build client for Android (Termux) |
 | `make deploy-local` | Deploy client to device for local execution |
+| `make renef-strace-android` | Build `renef-strace` for running on the device |
+| `make plugins` | Build and install the example plugins in `examples/plugins/` |
+| `make setup-client` | Fetch only what the host client needs (no Android NDK required) |
+| `make info` | Print the resolved build configuration (host, NDK, mode, paths) |
+| `make forward-list` / `make forward-clean` | Show / remove the ADB port forwards |
+| `make clean-all` | `clean` plus the Capstone build |
 
 ---
 

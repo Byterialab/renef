@@ -181,7 +181,7 @@ hook("com/android/org/conscrypt/TrustManagerImpl", "checkServerTrusted",
 ```
 
 {: .note }
-`args.skip = true` is essential on Android 16+ where calling the original method on nested hooked methods can crash ART's stack walker. See [Hook API - args.skip](/docs/api/hook/) for details.
+`args.skip = true` is what makes the bypass work: the original check, and the exception it would throw, never runs. See the [Hook API]({% link docs/api/hook.md %}) for details.
 
 ### Custom TrustManager with Java API
 

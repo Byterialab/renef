@@ -113,6 +113,93 @@ end
 
 ---
 
+## `Module.findExportByName(lib_name, pattern)`
+
+Search a library's exports (`.dynsym`) for names matching a glob pattern —
+`*` matches any run of characters, `?` matches exactly one character. A
+pattern with no wildcard characters behaves as an exact-name match, so this
+subsumes a plain lookup as well as a search over `Module.exports()`.
+
+```lua
+-- All pthread_* exports in libc.so
+local matches = Module.findExportByName("libc.so", "pthread_*")
+for _, sym in ipairs(matches) do
+    print(string.format("%s -> 0x%x", sym.name, sym.offset))
+end
+
+-- Exact match (no wildcards) - equivalent to filtering Module.exports() yourself
+local exact = Module.findExportByName("libc.so", "malloc")
+if #exact > 0 then
+    print(string.format("malloc offset: 0x%x", exact[1].offset))
+end
+```
+
+**Parameters:**
+- `lib_name` - Library name
+- `pattern` - Glob pattern (`*` / `?` wildcards) or an exact export name
+
+**Returns:** Table of matches (same shape as `Module.exports()`: `name` +
+`offset`), possibly empty if the library was found but nothing matched, or
+`nil` if the library itself could not be found/parsed.
+
+---
+
+## `Module.disassemble(addr, count)`
+
+Disassemble `count` ARM64 instructions starting at `addr`, read directly out
+of the agent's own address space (the agent already lives inside the target
+process, so there is no separate "read memory first" step).
+
+```lua
+local liblog = Module.find("liblog.so")
+local exports = Module.exports("liblog.so")
+for _, exp in ipairs(exports) do
+    if exp.name == "__android_log_print" then
+        local insns = Module.disassemble(liblog + exp.offset, 8)
+        for _, insn in ipairs(insns) do
+            local flags = ""
+            if insn.is_call then flags = flags .. " call" end
+            if insn.is_jump then flags = flags .. " jump" end
+            print(string.format("0x%x %s %s%s", insn.address, insn.mnemonic, insn.op_str, flags))
+        end
+        break
+    end
+end
+```
+
+**Parameters:**
+- `addr` - Address to start disassembling from (must be non-zero)
+- `count` - Number of instructions to decode (1-1024; larger values are
+  capped at 1024)
+
+**Returns:** 1-indexed table of instructions, each with:
+
+| Field | Type | Description |
+|---|---|---|
+| `address` | integer | Instruction's own address |
+| `size` | integer | Instruction size in bytes (always 4 on AArch64) |
+| `mnemonic` | string | Capstone's mnemonic, e.g. `"mov"` |
+| `op_str` | string | Capstone's formatted operand string, e.g. `"x0, x1, #4"` (not decomposed into structured operands) |
+| `is_branch` | boolean | True for any control-flow-transferring instruction (jump, call, return, or PC-relative branch) |
+| `is_call` | boolean | True for call instructions specifically |
+| `is_jump` | boolean | True for jump instructions specifically |
+
+**Raises a Lua error** (catchable with `pcall`) rather than crashing the
+process if:
+- `addr` is `0`, or `count` is `<= 0`
+- the `[addr, addr + count*4)` range isn't entirely inside one readable
+  `/proc/self/maps` region
+- Capstone fails to decode anything at `addr`
+
+```lua
+local ok, err = pcall(function() return Module.disassemble(0xdead0000, 4) end)
+if not ok then
+    print("disassemble failed: " .. tostring(err))
+end
+```
+
+---
+
 ## Difference: `exports()` vs `symbols()`
 
 | Feature | `Module.exports()` | `Module.symbols()` |
@@ -190,6 +277,16 @@ if symbols then
             print(string.format("%s: 0x%x", sym.name, sym.offset))
         end
     end
+end
+```
+
+For a glob search over exports specifically (skipping `Module.symbols()`
+when you don't need internal/static symbols), `Module.findExportByName()`
+does the filtering for you:
+
+```lua
+for _, sym in ipairs(Module.findExportByName("libflutter.so", "*ssl*")) do
+    print(string.format("%s: 0x%x", sym.name, sym.offset))
 end
 ```
 

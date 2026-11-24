@@ -43,7 +43,14 @@ Options:
   -d, --device <id>        Specify ADB device ID (for multiple devices)
   -l, --load <script>      Load Lua script after connection
   -w, --watch              Enable auto-watch mode after loading script
+  -p, --pause              Freeze app after spawn until a script is loaded (spawn gate)
   -v, --verbose            Show logcat debug output from agent
+  -m, --mode <mode>        Interface mode: v/view opens the terminal UI (default: CLI)
+  --json                   Machine-readable output (no colors, script results as JSON)
+  --timeout <seconds>      Auto-detach and exit after N seconds
+  --headless               No interactive shell: load -l script (if any) and wait
+  --memdump-pid <pid>      Passive memory read of <pid> (no injection); with
+                           --memdump-maps or --memdump-range <s>-<e>, and --out <file>
   --local                  Local mode: connect via UDS directly (for Termux/on-device)
   --hook <type>            Hook engine type: trampoline (default) or pltgot
   -h, --help               Show help message
@@ -59,6 +66,12 @@ Options:
 | `-d <device>` | Specifies which ADB device to use when multiple devices are connected. Use `adb devices` to list available devices. |
 | `-l <script>` | Loads and executes a Lua script immediately after successful injection. Can be combined with `-s` or `-a`. |
 | `-w` | Enables auto-watch mode. After loading the script, Renef monitors hook output in real-time. Press Ctrl+C to exit watch mode. |
+| `-p, --pause` | Spawn gate: the app is frozen before any of its code runs and resumes when the first script has been delivered, so hooks are in place for the very first call. Uses `ptrace` (see [Process Management]({% link docs/commands/process.md %})). |
+| `-m v`, `--mode view` | Starts the terminal UI instead of the prompt: tabs for hooks and modules, memory scan results, live hook output, logs and a console. Tab switches between them, Ctrl+C quits. |
+| `--json` | For scripts that drive the CLI: output is printed without color codes, and the `-l` script (and every `exec`) is answered with one JSON line - `{"ok":..., "pid":..., "timed_out":..., "output":"..."}` - instead of free text. Usually combined with `--headless`. |
+| `--headless` | Skips the interactive shell. Renef spawns/attaches, loads the `-l` script, relays hook output to stdout and waits - until `--timeout` expires, or Ctrl+C. For CI jobs and pipelines. |
+| `--timeout <seconds>` | Detaches and exits after the given time. Mostly used with `--headless`. |
+| `--memdump-pid <pid>` | Reads another process's memory through `renef_server` without injecting anything. See [`memdump`]({% link docs/commands/memory.md %}). |
 | `-v, --verbose` | Enables verbose mode. Shows agent debug output from logcat during `spawn`, `attach`, and script loading (`l`). Useful for troubleshooting injection and hook issues. |
 | `--local` | Connects via Unix Domain Socket directly, skipping ADB and TCP. For running on the device itself (Termux/ADB shell). Works with SELinux enforcing. See [Local Mode]({% link docs/local-mode.md %}). |
 | `--hook <type>` | Selects the hooking engine. `trampoline` (default) uses inline hooks, `pltgot` hooks via PLT/GOT table. |

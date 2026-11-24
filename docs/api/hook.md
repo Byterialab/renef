@@ -45,6 +45,7 @@ hook("libc.so", 0x12340, {
 | `onEnter` | function | Called before the original function |
 | `onLeave` | function | Called after the original function returns |
 | `caller` | string or table | Filter: only hook calls from this library (enables PLT/GOT hooking) |
+| `async` | boolean | Fire-and-forget: run `onEnter` later on a worker thread instead of inside the call (see [Async hooks](#async-hooks)) |
 
 ```lua
 -- Hook only calls to malloc from libnative.so (PLT/GOT mode)
@@ -73,6 +74,44 @@ hook("libc.so", open_offset, {
 - `retval` - Return value from function (x0 register)
 - Return a value to replace the original return value
 
+### Hooks on libraries that are not loaded yet
+
+If `library` is not loaded when `hook()` runs, the hook is registered as
+pending and installed the moment the library is loaded: the agent watches
+`dlopen`/`android_dlopen_ext`, so the hook is in place before the library's
+own code gets to run. Together with `--pause` (the target is frozen until the
+script has been delivered) this catches the very first call.
+
+### Async hooks
+
+A normal hook runs its Lua callback inside the hooked call: the calling thread
+waits for the Lua VM and for your code. For a function that is called very
+often and that you only want to observe, `async = true` takes that cost off
+the caller:
+
+```lua
+hook("libc.so", malloc_offset, {
+    async = true,
+    onEnter = function(args)
+        counts = (counts or 0) + 1
+    end
+})
+```
+
+The hooked thread only copies the eight argument registers into a ring buffer
+and carries on; a worker thread calls `onEnter` afterwards. This has
+consequences:
+
+- **Observation only.** Changing `args` has no effect, and there is no
+  `onLeave` (`hook()` raises an error if both are given).
+- **The call has already happened** when the callback runs. `args` are the
+  register values as they were; memory they point to may have changed or been
+  freed in the meantime, so read strings and buffers with care.
+- **Native hooks only**, not Java methods.
+- The buffer holds 4096 calls. If the worker cannot keep up, further calls are
+  not recorded (the count of dropped calls is logged to logcat) - the hooked
+  function is never slowed down or blocked.
+
 ### Stack Trace in Hooks
 
 Use `Thread.backtrace()` inside hook callbacks to see who called the hooked function:
@@ -89,102 +128,220 @@ hook("libc.so", fopen_offset, {
 
 ---
 
-## `hook(class, method, signature, callbacks)`
+## `Interceptor.replace(library, offset, callback [, caller])`
 
-Hook a Java method via JNI.
+Replace a native function entirely. `callback(args)` runs **instead of** the
+original, and its return value becomes the call's result. `args[0..7]` are the
+incoming ARM64 argument registers `x0-x7`.
+
+```lua
+-- Force a check to always "succeed" (return 1)
+Interceptor.replace("libnative.so", 0x1234, function(args)
+    return 1
+end)
+```
+
+To run the original from inside the replacement, wrap its address in
+`NativeFunction` and call it. Calling the hooked address re-enters the hook, and
+a thread-local reentrancy guard routes that call through the saved original
+prologue — so you get the real function, not infinite recursion:
+
+```lua
+local base = Module.find("libnative.so")
+local original = NativeFunction(base + 0x1234, "int", {"pointer", "int"})
+
+Interceptor.replace("libnative.so", 0x1234, function(args)
+    local real = original(args[0], args[1])   -- runs the ORIGINAL
+    return real + 1                            -- tamper the result
+end)
+```
+
+- The return value may be a number (returned in `x0`), or `nil`/`false` (= 0).
+- A replace hook occupies a hook slot like any other hook (`MAX_HOOKS`).
+- If the library is not loaded yet, the replace is deferred and installed the
+  moment it loads (same as `hook`).
+- Pass an optional `caller` library (string) to install via **PLT/GOT** for that
+  caller's call sites instead of the default inline trampoline; `"*"` targets all
+  loaded libraries.
+
+---
+
+## `Interceptor.revert(library, offset)`
+
+Remove the hook that was installed at `(library, offset)` - by `hook()` or by
+`Interceptor.replace()` - and restore the original code (or GOT entries). The
+target keeps running; nothing has to be respawned.
+
+```lua
+Interceptor.replace("libnative.so", 0x1234, function(args) return 0 end)
+-- ... later ...
+Interceptor.revert("libnative.so", 0x1234)
+```
+
+It takes the same `(library, offset)` pair that installed the hook, so a script
+never has to remember hook ids or resolve addresses. A Lua error is raised if
+the library is not loaded or nothing is hooked at that address (for example a
+second `revert` of the same hook); wrap it in `pcall` if that can happen.
+
+From the CLI, `unhook <id>` and `unhook all` do the same by hook id.
+
+---
+
+## `NativeFunction(address [, retType [, argTypes]])`
+
+Wrap a native function address in a Lua callable, so you can invoke native code
+directly from a script (including a hooked function's original).
+
+```lua
+local base   = Module.find("libc.so")
+local getpid = NativeFunction(base + off_getpid, "int")
+print(getpid())                      -- current pid
+
+local atoi = NativeFunction(base + off_atoi, "int", {"pointer"})
+print(atoi("1234"))                  -- 1234
+print(atoi(Memory.allocStr("567")))  -- 567
+```
+
+**Arguments** are marshalled into `x0-x7`:
+
+| Lua type | Passed as |
+|----------|-----------|
+| number   | integer value (also used for pointers/addresses) |
+| string   | pointer to its NUL-terminated bytes (valid for the call) |
+| boolean  | `1` / `0` |
+| nil      | `0` |
+
+**`retType`** (default `"pointer"`) controls how the result is converted:
+`"int"` / `"long"` / `"pointer"` → integer (from `x0`), `"bool"` → boolean,
+`"string"` → Lua string (reads the returned `char*`), `"float"` / `"double"` →
+number (from `d0`), `"void"` → no return value.
+
+**`argTypes`** is only needed for floating-point arguments. A position declared
+as `"float"` or `"double"` is passed in the next free floating-point register
+(`d0-d7`) instead of the next integer register, as the ARM64 calling convention
+requires; everything else is passed as an integer/pointer whatever its declared
+type. The argument count is taken from the call itself.
+
+```lua
+local libm = Module.find("libm.so")
+local sym  = Module.findExportByName("libm.so", "pow")[1]
+local pow  = NativeFunction(libm + sym.offset, "double", {"double", "double"})
+print(pow(2.0, 10.0))                -- 1024.0
+```
+
+{: .warning }
+> **Limits:** up to 8 integer/pointer arguments (`x0-x7`) and up to 8
+> floating-point arguments (`d0-d7`). More arguments than that (stack-passed)
+> and struct arguments/returns are not supported.
 
 {: .note }
-> **Android 10+ Supported**: Java hooks with `onEnter` and `onLeave` callbacks work on Android 10 (API 29) and later. Tested and verified on Android 10, 11, 12, 13, 14, 15, and 16.
+> Many ARM64 libc functions (`strlen`, `strcmp`, `memcpy`...) are IFUNC symbols: the symbol table points at a resolver, not at the code that runs. `Module.exports()` and `Module.findExportByName()` return the resolved implementation, so the addresses they give can be hooked and called directly.
 
-{: .highlight }
-> **Nested Hooks Supported** (v0.2.2+): Java hooks can be nested recursively with proper call stack tracking. Hook callbacks can safely call other hooked methods.
+---
+
+## `hook(class, method, signature, callbacks)`
+
+Hook a Java method.
 
 ```lua
 hook("com/example/MainActivity", "getSecret", "(Ljava/lang/String;)Ljava/lang/String;", {
     onEnter = function(args)
         print("[+] MainActivity.getSecret() called")
-        print(string.format("    this: 0x%x", args[1]))
-        print(string.format("    param1: 0x%x", args[2]))
+        print("    param1: " .. tostring(Jni.getStringUTF(args[2])))
     end,
     onLeave = function(retval)
-        print(string.format("[*] Original return: 0x%x", retval.raw))
         if retval.value then
-            print("    String value: " .. retval.value)
+            print("    returned: " .. retval.value)
         end
-
-        -- Create and return a new string
-        local newStr = Jni.newStringUTF("Modified!")
-        return newStr
+        return JNI.string("Modified!")      -- replace the result
     end
 })
 ```
 
 **Parameters:**
-- `class` - Class name with `/` separators (e.g., "com/example/MainActivity")
+- `class` - Class name (`com/example/MainActivity`; dots are accepted too)
 - `method` - Method name
 - `signature` - JNI signature (e.g., "(Ljava/lang/String;)Ljava/lang/String;")
 - `callbacks` - Table with `onEnter` and/or `onLeave` functions
 
-**Java hook `onEnter` — `args` table:**
+Static and instance methods, constructors (`<init>`) and methods that are
+already `native` can all be hooked. The hook shows up in `hooks` as `[jN]` with
+its call counter and is removed with `unhook jN` or `unhook all`.
+
+**`onEnter` — `args` table:**
 
 | Key | Type | Description |
 |-----|------|-------------|
 | `args[0]` | integer | ArtMethod pointer (internal, not useful to scripts) |
-| `args[1]` | integer | `this` pointer (instance methods) or first parameter (static methods) |
-| `args[2..7]` | integer | Method parameters as raw pointers |
+| `args[1]` | integer | `this` (instance methods) or the first parameter (static methods) |
+| `args[2..7]` | integer | The following parameters. Objects are raw references (pass them to `Jni.getStringUTF` etc.), integers and booleans their value |
 | `args.class` | string | Class name |
 | `args.method` | string | Method name |
 | `args.signature` | string | JNI signature |
 | `args.isStatic` | boolean | Whether method is static |
 | `args.skip` | boolean | Set to `true` to skip calling the original method entirely |
 
-Arguments are modifiable: `args[2] = newValue` will change the parameter passed to the original method.
+Arguments are modifiable: `args[2] = newValue` changes the parameter passed to
+the original method. `float` and `double` parameters are passed through to the
+original correctly but do not appear in `args`; the numbered entries are the
+other parameters, in order.
 
-**Java hook `onLeave` — `retval` table:**
+**`onLeave` — `retval` table:**
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `retval.raw` | integer | Raw return value (x0 register) |
+| `retval.raw` | integer | Return value: the number, or a raw reference for an object |
 | `retval.value` | string or nil | Decoded string content (only for methods returning `String`) |
-
-**`args.skip` — Skip Original Method:**
-
-Setting `args.skip = true` in `onEnter` prevents the original Java method from being called. The hook returns immediately with a zero value, and `onLeave` still runs normally.
-
-This is essential for void methods that signal failure by throwing exceptions (e.g., `checkServerTrusted`). Skipping the original avoids both the exception and potential ART stack walk crashes when multiple hooked methods are nested on the same call stack.
-
-```lua
-hook("javax/net/ssl/X509TrustManager", "checkServerTrusted",
-    "([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V", {
-    onEnter = function(args)
-        args.skip = true  -- Don't call original, method returns cleanly
-        print("[*] checkServerTrusted bypassed")
-    end
-})
-```
 
 **Modifying return values (`onLeave`):**
 
 | Return from onLeave | Effect |
 |---|---|
 | `nil` (or no return) | Original return value unchanged |
-| integer | Sets x0 register directly (e.g., `return 1` for true, `return 0` for false) |
-| `{__jni_type="string", value="..."}` | Creates a new Java String and returns it |
-| `{__jni_type="int", value=N}` | Sets x0 to N |
-| `{__jni_type="boolean", value=true}` | Sets x0 to 1 or 0 |
-| `Jni.newStringUTF("...")` | Returns raw pointer to new Java String |
+| integer | The new value (e.g., `return 1` for true, `return 0` for false) |
+| `JNI.string("...")` | A new Java String |
+| `JNI.int(N)`, `JNI.long(N)`, `JNI.boolean(b)` | The value, typed |
+| `Jni.newStringUTF("...")` | Reference to a new Java String |
+
+**`args.skip` — skip the original method:**
+
+Setting `args.skip = true` in `onEnter` prevents the original method from being
+called. `onLeave` still runs and supplies the result (zero / `null` if it
+returns nothing). Use it for checks that signal failure by throwing:
 
 ```lua
--- Return a modified string
-onLeave = function(retval)
-    return Jni.newStringUTF("Modified!")
-end
-
--- Return a boolean (for verify() methods)
-onLeave = function(retval)
-    return 1  -- true
-end
+-- Hook the class that implements the check, not the interface
+hook("com/example/net/PinningTrustManager", "checkServerTrusted",
+    "([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V", {
+    onEnter = function(args)
+        args.skip = true            -- the original (and its exception) never runs
+        print("[*] checkServerTrusted bypassed")
+    end
+})
 ```
+
+### How it behaves
+
+- **Exceptions pass through.** If the original method throws, the exception
+  reaches the caller exactly as without the hook. `onLeave` is not called for
+  that call (there is no return value).
+- **Interface and abstract methods cannot be hooked** - they have no code.
+  `hook()` raises an error that says so; hook the method of the implementing
+  class instead (`Java.enumerateLoadedClasses()` helps to find it).
+- **One hook per method.** A second `hook()` on the same method is refused
+  until the first is removed.
+- **Callbacks do not wait forever.** If the Lua VM is busy for more than half
+  a second (a long-running script, a slow callback), the call goes ahead
+  without its callback and a `callback(s) skipped` line is reported, so a
+  hooked method on the UI thread cannot freeze the app.
+- **Calls that the compiler inlined are not seen.** ART may copy the body of a
+  small method into its callers; those callers then never enter the method.
+  The sign is a hook that installs fine but whose `hits=` in `hooks` stays at
+  0, or grows slower than expected. Hook a larger method up or down the call
+  chain instead.
+
+{: .note }
+> **Android versions.** On Android 12 and later a hooked method is routed through a real JNI native method that ART knows how to walk past, so exceptions and garbage collections during a hooked call are safe. This was verified on Android 16. Android 10 and 11 still use the original mechanism, where a hooked method that throws (or a collection at the wrong moment) can crash the app.
 
 ---
 

@@ -184,6 +184,36 @@ Raw pointers are only valid while the object is alive. Do not cache them across 
 
 ---
 
+## Java.enumerateLoadedClasses()
+
+Returns the names of the classes in the app's own dex files, as an array of
+strings (`"com.example.app.MainActivity"`, ...). On failure it returns `nil`
+and an error message.
+
+```lua
+local classes, err = Java.enumerateLoadedClasses()
+if not classes then
+    print("failed: " .. tostring(err))
+    return
+end
+print(#classes .. " classes")
+for _, name in ipairs(classes) do
+    if name:find("^com%.example%.") then print(name) end
+end
+```
+
+The list comes from the app's context class loader (its `DexPathList`), read
+through JNI field access, which is not subject to the hidden-API restrictions
+that block the equivalent reflection calls. It therefore contains the classes
+the app ships; framework classes from the boot class path are not listed. Any
+name it returns can be passed to `Java.use()`.
+
+There is no `Java.choose()` (enumerating live *instances* of a class): that
+needs a walk of the ART heap, which has no stable entry point across Android
+versions.
+
+---
+
 ## Java.registerClass(definition)
 
 Register a new Java class at runtime that implements one or more interfaces. Method calls on the registered class are dispatched to Lua callbacks.

@@ -45,6 +45,34 @@ adb forward tcp:1907 localabstract:com.android.internal.os.RuntimeInit
 adb forward --list
 ```
 
+### adb cannot reach the server
+
+On some devices (seen on a Samsung with SELinux enforcing) `adbd` is not
+allowed to connect to the server's abstract socket: the client reports that
+the server closed the connection, and `adb logcat` shows
+`failed to connect to socket 'localabstract:...' (Permission denied)`. Run the
+server on a local TCP port instead and manage the forward yourself:
+
+```bash
+adb shell 'su -c "/data/local/tmp/renef_server --transport TCP --port 1907 &"'
+adb forward tcp:1907 tcp:1907
+RENEF_ADB_FORWARD=off renef -s com.example.app
+```
+
+The server listens on `127.0.0.1` only.
+
+### Two devices at once
+
+`adb forward` binds one host port to one device. Give the second device its
+own port:
+
+```bash
+adb -s <serial2> forward tcp:1908 localabstract:com.android.internal.os.RuntimeInit
+RENEF_PORT=1908 RENEF_ADB_FORWARD=off renef -d <serial2> -s com.example.app
+```
+
+In Python: `renef.connect(port=1908)`.
+
 ## Hooks Not Triggering
 
 1. Verify the offset is correct:
@@ -70,6 +98,15 @@ if not base then
     print("Library not loaded yet")
 end
 ```
+
+### Hook output does not appear
+
+Hook output is not printed in the middle of other commands. It waits on the
+server until you run `watch` (the CLI says `(N lines of hook output waiting)`
+under the reply of whatever you ran). `hooks` shows a `hits=` counter per hook,
+which tells you whether the hook is being reached at all - if it stays at 0 the
+function is not called (or you hooked the wrong address), if it grows your
+callback runs and the output is waiting for `watch`.
 
 ## Memory Access Violations
 
@@ -244,3 +281,19 @@ Renef aims for API compatibility with Frida where possible:
 | `Memory.writeByteArray()` | `Memory.patch()` | Handles mprotect |
 | `Java.use()` | `hook(class, method, sig)` | Direct JNI hooking |
 | `send()` | `print()` | Output to client |
+
+## Environment Switches
+
+For narrowing down a problem or for an unusual setup; none of them is needed in normal use.
+
+| Variable | Where | Effect |
+|----------|-------|--------|
+| `RENEF_NO_CODE_CAVE=1` | `renef_server` | Inject with the older method (several instructions of `malloc` are overwritten) instead of the code-cave method. Try it if injection fails on a device. |
+| `RENEF_NO_EVENT_CHANNEL=1` | `renef_server` | Do not open the separate connection for hook output; it is mixed into command replies as in older versions. |
+| `RENEF_DEVICE_ID` | host | Set by the CLI from `-d <device>`; the ADB device used for port forwarding. |
+| `RENEF_PORT=<port>` | host | Host port the CLI forwards and connects to (default `1907`). |
+| `RENEF_ADB_FORWARD=off` | host | The CLI leaves `adb forward` alone; set the forward yourself. |
+
+```bash
+adb shell 'su -c "RENEF_NO_CODE_CAVE=1 /data/local/tmp/renef_server"'
+```

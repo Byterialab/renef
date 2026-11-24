@@ -53,7 +53,12 @@ end
 | Frida (JS) | Renef (Lua) |
 |-------------|-------------|
 | `Interceptor.attach(ptr(addr), callbacks)` | `hook("lib.so", offset, callbacks)` |
+| `Interceptor.replace(ptr(addr), new NativeCallback(...))` | `Interceptor.replace("lib.so", offset, function(args) ... end)` |
+| `Interceptor.revert(ptr(addr))` | `Interceptor.revert("lib.so", offset)` |
+| `new NativeFunction(ptr(addr), 'int', ['pointer'])` | `NativeFunction(addr, "int", {"pointer"})` |
 | `Interceptor.detachAll()` | `unhook all` (CLI command) |
+| `send(message)` | `send(table)` |
+| `Java.enumerateLoadedClasses()` | `Java.enumerateLoadedClasses()` (classes of the app's dex files) |
 
 {: .highlight }
 > Renef hooks take a **library name + offset** pair instead of an absolute address. The offset is relative to the library base.

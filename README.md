@@ -4,10 +4,10 @@
 
 **Dynamic Instrumentation Toolkit for Android ARM64**
 
-[![Release](https://img.shields.io/github/v/release/ahmeth4n/renef?style=flat-square&color=blue)](https://github.com/ahmeth4n/renef/releases)
-[![License](https://img.shields.io/github/license/ahmeth4n/renef?style=flat-square)](https://github.com/ahmeth4n/renef/blob/main/LICENSE)
-[![Stars](https://img.shields.io/github/stars/ahmeth4n/renef?style=flat-square)](https://github.com/ahmeth4n/renef/stargazers)
-[![Issues](https://img.shields.io/github/issues/ahmeth4n/renef?style=flat-square)](https://github.com/ahmeth4n/renef/issues)
+[![Release](https://img.shields.io/github/v/release/Byterialab/renef?style=flat-square&color=blue)](https://github.com/Byterialab/renef/releases)
+[![License](https://img.shields.io/github/license/Byterialab/renef?style=flat-square)](https://github.com/Byterialab/renef/blob/main/LICENSE)
+[![Stars](https://img.shields.io/github/stars/Byterialab/renef?style=flat-square)](https://github.com/Byterialab/renef/stargazers)
+[![Issues](https://img.shields.io/github/issues/Byterialab/renef?style=flat-square)](https://github.com/Byterialab/renef/issues)
 [![Docs](https://img.shields.io/badge/docs-renef.io-green?style=flat-square)](https://renef.io)
 
 [Documentation](https://renef.io) • [Installation](https://renef.io/docs/installation.html) • [Getting Started](https://renef.io/docs/getting-started.html) • [Examples](https://renef.io/docs/examples/)

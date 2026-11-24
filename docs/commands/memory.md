@@ -37,6 +37,23 @@ Found 2 match(es):
 
 ---
 
+A scan covers the readable memory of the process and takes several seconds on
+a large app (about ten with 400 loaded modules). Device memory that cannot be
+read safely (GPU driver mappings, for example) is skipped. The
+pattern must be complete pairs of hex digits; anything else is rejected with
+`Invalid pattern`.
+
+## `msj <pattern>`
+
+The same scan with a machine-readable result, one JSON line:
+
+```json
+{"success":true,"count":2,"results":[{"library":"libc.so","offset":4096,"address":530242908160,"hex":"...","ascii":"..."}]}
+```
+
+`address` and `offset` are decimal. This is what the TUI and other tools use;
+at the prompt `ms` is easier to read.
+
 ## `msi <pattern>`
 
 Interactive memory scan with TUI. Allows selecting results and performing actions.
@@ -76,6 +93,12 @@ md 0x7f8a1c2b0 256
 md 0x7f8a1c2b0 64 -d
 ```
 
+`renef_server` reads the bytes from `/proc/<pid>/mem` itself, so the result does
+not depend on the agent: it stays correct while hooks are printing, and it also
+covers execute-only code (`--x` mappings) that the target cannot read. Where
+that file cannot be opened (a server not running as root), the agent is asked
+instead.
+
 **Hex Dump Output:**
 ```
 Memory at 0x7f8a1c2b0 (256 bytes):
@@ -93,6 +116,64 @@ Memory at 0x7f8a1c2b0 (64 bytes):
 0x7f8a1c2bc:  fd 7b c1 a8    ldp x29, x30, [sp], #0x10
 0x7f8a1c2c0:  c0 03 5f d6    ret
 ```
+
+---
+
+## `sec <library>`
+
+List the ELF sections of a loaded library, as found in its file on the device.
+
+```bash
+sec libnative.so
+```
+
+```
+Sections in /data/app/.../lib/arm64/libnative.so (23 total):
+Name                 Addr             Size             Type
+------------------------------------------------------------
+.dynsym              0x00000000000308 0x00000000000288 DYNSYM
+.dynstr              0x00000000000648 0x0000000000028a STRTAB
+.text                0x00000000004e08 0x00000000000554 PROGBITS
+...
+```
+
+`Addr` is the section's address inside the library; add the library's base
+(`Module.find`) for the address in the running process.
+
+---
+
+## `memdump <pid> --maps` / `memdump <pid> <start>-<end>`
+
+Read the memory of **any** process without injecting into it. `renef_server`
+reads `/proc/<pid>/maps` and `/proc/<pid>/mem` itself: no agent, no spawn or
+attach, no `ptrace`, and nothing in the target is modified. Useful for a first
+look at a protected app, or for a process you do not want to touch.
+
+```bash
+# What is mapped where
+memdump 12345 --maps
+
+# Read a range (hex addresses, at most 4 MiB per request)
+memdump 12345 7b0a45a000-7b0a45b000
+```
+
+The reply is text, so it survives any transport: a manifest line, one
+`SEG OK start=0x... len=N hex=...` line per readable piece (`SEG ERR ...` for
+pages that cannot be read), and a summary with a checksum of the bytes.
+
+The same thing from the host, written straight to a file:
+
+```bash
+./build/renef --memdump-pid 12345 --memdump-maps
+./build/renef --memdump-pid 12345 --memdump-range 7b0a45a000-7b0a45b000 --out dump.bin
+```
+
+`--out` writes the bytes to `dump.bin` and a manifest next to it; without it
+the output goes to the terminal. `--memdump-port <port>` talks to a server on a
+port other than the default 1907.
+
+{: .note }
+> "No injection" is not the same as "undetectable": the read is still subject to SELinux and to what the kernel lets a root process see of the target.
 
 ---
 

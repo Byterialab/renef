@@ -1,0 +1,88 @@
+# Renef
+
+> Renef is a dynamic instrumentation toolkit for Android ARM64 (a Frida-like
+> tool): a host CLI client talks to an on-device `renef_server` daemon, which
+> injects `libagent.so` (an embedded Lua 5.4 VM) into the target process. Scripts
+> hook native and Java/ART functions, scan/patch memory, and call native code —
+> all from Lua. Default injection is signal-based (no ptrace); a `--pause`
+> spawn-gate path uses ptrace to freeze the target before its code runs.
+
+URLs below assume Jekyll's default permalink style (no `permalink:` override is
+set in `_config.yml`), so each page is served at its source path with a `.html`
+extension, under the custom domain in `CNAME` (`https://renef.io`). This was
+not confirmed by an actual site build.
+
+## Getting Started
+
+- [Introduction](https://renef.io/docs/introduction.html): What Renef is, its design goals, and its Frida/Radare2 influences.
+- [Behind the Project](https://renef.io/docs/behind-the-project.html): Author's motivation for building a small, fully-understood alternative to larger instrumentation frameworks.
+- [Architecture](https://renef.io/docs/architecture.html): Breakdown of the client/server/agent components — host CLI, on-device `renef_server`, and injected `libagent.so`.
+- [Installation & Build](https://renef.io/docs/installation.html): Build requirements (Android NDK, CMake, ADB, rooted device) and the `make` targets for client/server/payload.
+- [Getting Started](https://renef.io/docs/getting-started.html): Quick-start walkthrough — start the server, run the client, spawn or attach to a target app.
+- [Scripting Guide](https://renef.io/docs/scripting-guide.html): Basic Lua hooking example and the fundamentals of writing Renef scripts.
+- [Frida to Renef](https://renef.io/docs/frida-to-renef.html): Migration guide mapping common Frida JavaScript APIs to their Renef Lua equivalents, side by side.
+- [Gadget Mode](https://renef.io/docs/gadget-mode.html): Using Renef on non-rooted devices by embedding `libagent.so` directly into the target APK.
+- [Local Mode (--local)](https://renef.io/docs/local-mode.html): Running client and server entirely on-device over Unix Domain Sockets, bypassing ADB/TCP; works under enforcing SELinux.
+- [Plugin Development](https://renef.io/docs/plugins.html): Writing native CLI plugins (`.so`/`.dylib`/`.dll`), host-only (not deployed to the on-device agent/server). Covers the `PLUGIN_COMMAND`/`PLUGIN_EXTERNAL_TOOL`/`PLUGIN_FORMATTER` type taxonomy, the claim-model (`ren_plugin_want`, a plugin that sees every command before falling back to fixed-name dispatch — e.g. an audit-trail logger), the `format <name> <command...>` pipeline for pluggable output formats, the `ren_plugin_result_json()` structured-result export, manual `plugin load`/`plugin unload`/`plugin list` CLI subcommands, and the bundled Redex `EXTERNAL_TOOL` example plugin that orchestrates Meta's Redex DEX optimizer.
+- [Troubleshooting](https://renef.io/docs/troubleshooting.html): Fixes for common problems such as the server failing to start.
+
+## Lua API Reference
+
+- [Lua API Reference](https://renef.io/docs/api/index.html): Index of every Lua global available to scripts running inside the injected agent.
+- [Module API](https://renef.io/docs/api/module.html): `Module.find`/`list`/`exports`/`symbols`/`findExportByName` (glob-pattern export search) for inspecting loaded libraries and resolving their symbols, and `Module.disassemble` for Capstone-based ARM64 disassembly of a live address range.
+- [Memory API](https://renef.io/docs/api/memory.html): `Memory.search`/`scan`/`dump`/`read`/`write`/`patch` plus the `alloc`/`allocStr`/`protect`/`free` allocation lifecycle, and `hexdump`.
+- [Hook API](https://renef.io/docs/api/hook.html): The `hook()` global for native and Java function hooking (Java hooks pass exceptions through, cannot target interface/abstract methods, and do not see inlined calls) (including `async` fire-and-forget hooks and hooks on libraries that are not loaded yet), `Interceptor.replace` / `Interceptor.revert`, and `NativeFunction` for calling native code from Lua (integer, pointer, `float` and `double` arguments); documents the `/proc/self/mem`-based patch engine.
+- [Process API](https://renef.io/docs/api/process.html): `Process.enumerateRanges`/`enumerateThreads` for whole-process memory-map and thread-ID introspection (unscoped, unlike `Module`'s per-library view).
+- [Thread API](https://renef.io/docs/api/thread.html): `Thread.backtrace` (PAC-aware, automatically skips hook-infrastructure frames when called from onEnter/onLeave) and `Thread.id`.
+- [Console API](https://renef.io/docs/api/console.html): `console.log`, the overridden `print`, the color globals used for script output, and `send()` — a separate structured-JSON event channel (`[event] {...}` lines) for findings a pipeline should parse, distinct from human-readable `print`/`console.log` text.
+- [File API](https://renef.io/docs/api/file.html): `File.exists`/`read`/`readlink`/`fdpath` for filesystem access from inside the target process.
+- [Java API](https://renef.io/docs/api/java.html): `Java.use` and the resulting class/instance wrappers for calling Java static and instance methods via JNI from Lua; `Java.enumerateLoadedClasses()` for the class names in the app's dex files.
+- [Syscall API](https://renef.io/docs/api/syscall.html): `Syscall.trace`/`traceAll`/`untrace` for PLT/GOT-based libc syscall tracing from Lua scripts, without ptrace.
+- [KCov API](https://renef.io/docs/api/kcov.html): `KCov.open` and coverage-state methods for kernel code coverage collection via Linux KCOV (requires `CONFIG_KCOV=y` and root).
+- [OS API](https://renef.io/docs/api/os.html): `OS.getpid` and other process/filesystem utility functions.
+
+## Command Reference
+
+- [Command Reference](https://renef.io/docs/commands/index.html): Index of every interactive `renef` CLI command, grouped by category.
+- [Process Management](https://renef.io/docs/commands/process.html): `spawn` (with `--hook=pltgot` and the `--pause` ptrace spawn-gate), `resume`, and `attach`.
+- [Application Management](https://renef.io/docs/commands/application.html): `la [~filter]` for listing installed apps on the device without needing to spawn/attach first.
+- [Script Execution](https://renef.io/docs/commands/script.html): `exec` for running inline Lua (`--timeout`, `--json`), `rpc` for getting a Lua value back as JSON, `events` for fetching held hook output, and `l` for loading script files (with `--watch`).
+- [Process Management](https://renef.io/docs/commands/process.html) also covers `--timeout <seconds>`/`--headless`: a non-interactive, bounded-runtime invocation for CI/pipeline use (`renef -s pkg -l script.lua --timeout 30 --headless`), with deterministic exit codes (0 OK, 2 connect/spawn failure, 3 Lua error, 4 hook-install failure).
+- [Memory Operations](https://renef.io/docs/commands/memory.html): `ms`/`msi`/`md` commands for scanning and dumping memory from the interactive shell, and `memdump` (`--memdump-pid` on the host) for reading any process's memory without injecting into it.
+- [Hook Management](https://renef.io/docs/commands/hooks.html): `hooks` (with a per-hook `hits=` call counter), `hookn` (hook a native function by offset or symbol and log its calls, no script needed), `unhook`, and `hookgen` for listing, removing, and generating hooks.
+- [Real-time Monitoring](https://renef.io/docs/commands/monitoring.html): `watch` for hook output. Hook output travels on its own channel and is never mixed into other commands' replies: it waits on the server until `watch` (or `events`) asks for it.
+- [Utility Commands](https://renef.io/docs/commands/utility.html): `help`, `q`, `clear`, `color` theme commands, and `mcp` (a stdio Model Context Protocol client for calling tools of a local MCP server).
+- [AI Implementation](https://renef.io/docs/commands/ai.html): `ai <prompt>` for generating Renef Lua scripts from natural language via local/cloud LLM providers (Ollama, OpenAI, Anthropic).
+
+## Related Tools
+
+- [renef-strace](https://renef.io/docs/renef-strace.html): Standalone syscall-tracer binary using PLT/GOT hooking, no ptrace required; also exposed as a shell command and a Lua API.
+- [r2renef](https://renef.io/docs/r2renef.html): Radare2 IO plugin that opens a live Android process through Renef: memory ranges as io maps, modules/exports as flags, `:hook` at the cursor, `:bt`, `:strace`, in-target search, execute-only code reads, and how to import flags from a static session.
+- [magisk-renef](https://renef.io/docs/magisk-renef.html): Magisk/KernelSU/APatch module that auto-installs and starts the Renef server on boot on rooted devices.
+- [Hookshare](https://renef.io/docs/hookshare.html): Community platform (hook.renef.io) for sharing and downloading ready-to-use Renef Lua hook scripts.
+- [Python Binding](https://renef.io/docs/python-binding.html): Pure-Python client (`renef.connect()`, `Session`) that talks to `renef_server` directly: hooks with Python callbacks, `rpc()` values, memory/module/Java helpers; keeps the older `Renef`/`RenefSession` names.
+
+## Real-World Examples
+
+- [Real-World Examples](https://renef.io/docs/examples/index.html): Index of practical example scripts for common reverse-engineering tasks.
+- [SSL Pinning Bypass](https://renef.io/docs/examples/ssl-bypass.html): Bypassing SSL pinning, including a Flutter/BoringSSL-specific variant that hooks `libflutter.so` at load time.
+- [Root Detection Bypass](https://renef.io/docs/examples/root-bypass.html): Hooking common root-detection functions (`access`, `fopen`, `stat`) to spoof their results.
+- [Crypto Key Logger](https://renef.io/docs/examples/crypto-logger.html): Hooking `libcrypto.so` AES key-schedule functions to log encryption keys as they're set.
+- [Function Call Tracer](https://renef.io/docs/examples/tracer.html): Tracing every call into a target library to log arguments and callers.
+- [Interactive Memory Search](https://renef.io/docs/examples/memory-search.html): Searching process memory for a specific 32-bit integer value using the Memory API.
+- [Syscall Tracer](https://renef.io/docs/examples/strace.html): Using `Syscall.trace` to monitor file-related syscalls in a target app.
+- [CTF - DereLabs 0x9](https://renef.io/docs/examples/ctf-derelabs.html): Walkthrough solving an Android CTF challenge by hooking a native function and forcing its return value to `1337`.
+- [Pentest Recipes](https://renef.io/docs/examples/recipes.html): The ready-to-run scripts in `scripts/recipes/` (SSL pinning bypass, root/Frida/emulator detection bypass, taint filter, in-memory engine capture, Java reflection dump) and their limits.
+
+## Release Notes
+
+- [Release Notes](https://renef.io/docs/release-notes/index.html): Index of version history and changelogs for Renef.
+- [v0.4.0](https://renef.io/docs/release-notes/v0.4.0.html): Separate channel for hook output, framed requests, rewritten Python client, reworked native hook engine and injection, new Lua APIs (`Interceptor.replace`/`revert`, `NativeFunction`, async hooks, `send`, `Module.disassemble`, `Process.*`, `Java.enumerateLoadedClasses`), new commands (`rpc`, `events`, `memdump`, `mcp`), plugins and recipes; r2renef 0.2.0.
+- [v0.3.7](https://renef.io/docs/release-notes/v0.3.7.html): Adds the Memory allocation API lifecycle (`alloc`/`allocStr`/`protect`/`free`) for building buffers, structs, and strings in scripts.
+- [v0.3.6](https://renef.io/docs/release-notes/v0.3.6.html): Adds the `ai` command for LLM-powered Lua script generation, with multi-provider support (Ollama, OpenAI, Anthropic) and agentic tool calling.
+
+## Project Info
+
+- [Contributing](https://renef.io/docs/contributing.html): Areas open for contribution — new Lua APIs, hooking examples, performance work, docs, and bug fixes.
+- [Credits](https://renef.io/docs/credits.html): Third-party components (Lua, Capstone, Android NDK) and project inspirations/acknowledgements.
+- [License](https://renef.io/docs/license.html): Full text of the GNU GPLv3 license Renef is distributed under.
