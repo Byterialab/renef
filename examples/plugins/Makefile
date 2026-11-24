@@ -8,7 +8,13 @@ RENEF_SDK := ../../src/librenef/include
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
     PLUGIN_EXT := .dylib
-    LDFLAGS := -dynamiclib
+    # Plugins reference ren_print/ren_exec/ren_recv, which are only defined
+    # in the renef host client binary that dlopen()s them at runtime -- they
+    # don't exist yet at plugin link time. macOS's two-level namespace
+    # linker rejects that by default; -undefined dynamic_lookup defers
+    # resolution to dlopen/runtime, matching how Linux's -shared already
+    # behaves for undefined symbols.
+    LDFLAGS := -dynamiclib -undefined dynamic_lookup
 else ifeq ($(UNAME_S),Linux)
     PLUGIN_EXT := .so
     LDFLAGS := -shared
