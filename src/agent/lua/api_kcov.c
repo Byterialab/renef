@@ -1,6 +1,7 @@
 #include <agent/lua_kcov.h>
 #include <agent/kcov.h>
 #include <agent/globals.h>
+#include <agent/output_queue.h>
 
 #include <lua.h>
 #include <lualib.h>
@@ -11,11 +12,19 @@
 
 extern int g_output_client_fd;
 
+/* Enqueues onto the bounded output_queue instead of calling write()
+ * directly -- see agent/output_queue.h. Keeps the hook-callback path
+ * (which runs with g_lua_mutex held) off of socket I/O. */
 static void send_to_cli(const char* msg) {
     if (g_output_client_fd >= 0 && msg) {
         size_t len = strlen(msg);
-        write(g_output_client_fd, msg, len);
-        write(g_output_client_fd, "\n", 1);
+        char* buf = (char*)malloc(len + 1);
+        if (buf) {
+            memcpy(buf, msg, len);
+            buf[len] = '\n';
+            output_queue_push(buf, len + 1);
+            free(buf);
+        }
     }
 }
 

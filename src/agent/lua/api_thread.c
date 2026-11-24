@@ -1,3 +1,4 @@
+#include <agent/hook.h>
 #include <agent/lua_thread.h>
 #include <agent/lua_engine.h>
 #include <agent/globals.h>
@@ -176,7 +177,12 @@ static int lua_thread_backtrace(lua_State* L) {
     uintptr_t start_fp;
     uintptr_t first_lr = 0;
 
-    if (g_hook_caller_fp != 0) {
+    if (hook_current_caller_fp() != 0) {
+        // Inside a native hook callback (native.c).
+        start_fp = hook_current_caller_fp();
+        first_lr = hook_current_caller_lr();
+    } else if (g_hook_caller_fp != 0) {
+        // Inside a Syscall.trace callback (strace.c).
         start_fp = g_hook_caller_fp;
         first_lr = g_hook_caller_lr;
     } else if (lua_gettop(L) >= 1 && lua_isinteger(L, 1)) {

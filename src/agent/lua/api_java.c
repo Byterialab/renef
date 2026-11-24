@@ -1,6 +1,7 @@
 #include <agent/lua_java.h>
 #include <agent/lua_engine.h>
 #include <agent/globals.h>
+#include <agent/hook.h>
 #include <agent/agent.h>
 #include <agent/bridge_dex.h>
 #include <agent/hook_java.h>
@@ -51,35 +52,47 @@ static bool setup_class_loader(JNIEnv* env) {
         return true;
     }
 
-    jclass thread_class = (*env)->FindClass(env, "java/lang/Thread");
-    if (!thread_class) {
-        LOGE("Failed to find Thread class");
+    // This used to go through
+    // Thread.currentThread().getContextClassLoader() -- which returns
+    // NULL on the agent's own injected thread, since it was never set up
+    // by the Android runtime with a context ClassLoader the way a normal
+    // app thread is (confirmed via logcat: "Failed to get ClassLoader").
+    // ActivityThread.currentApplication().getClassLoader() doesn't depend
+    // on which thread calls it -- it's the actual Application singleton's
+    // own loader, always set once the app has started.
+    jclass activity_thread_class = (*env)->FindClass(env, "android/app/ActivityThread");
+    if (!activity_thread_class) {
+        LOGE("Failed to find ActivityThread class");
+        (*env)->ExceptionClear(env);
         return false;
     }
 
-    jmethodID current_thread = (*env)->GetStaticMethodID(
-            env, thread_class, "currentThread", "()Ljava/lang/Thread;");
-    if (!current_thread) {
-        LOGE("Failed to find currentThread method");
+    jmethodID current_application = (*env)->GetStaticMethodID(
+            env, activity_thread_class, "currentApplication", "()Landroid/app/Application;");
+    if (!current_application) {
+        LOGE("Failed to find ActivityThread.currentApplication()");
+        (*env)->ExceptionClear(env);
         return false;
     }
 
-    jobject thread = (*env)->CallStaticObjectMethod(env, thread_class, current_thread);
-    if (!thread) {
-        LOGE("Failed to get current thread");
+    jobject application = (*env)->CallStaticObjectMethod(env, activity_thread_class, current_application);
+    if (!application) {
+        LOGE("ActivityThread.currentApplication() returned null");
         return false;
     }
 
-    jmethodID get_class_loader = (*env)->GetMethodID(
-            env, thread_class, "getContextClassLoader", "()Ljava/lang/ClassLoader;");
+    jclass context_class = (*env)->FindClass(env, "android/content/Context");
+    jmethodID get_class_loader = context_class ?
+        (*env)->GetMethodID(env, context_class, "getClassLoader", "()Ljava/lang/ClassLoader;") : NULL;
     if (!get_class_loader) {
-        LOGE("Failed to find getContextClassLoader method");
+        LOGE("Failed to find Context.getClassLoader()");
+        (*env)->ExceptionClear(env);
         return false;
     }
 
-    jobject class_loader = (*env)->CallObjectMethod(env, thread, get_class_loader);
+    jobject class_loader = (*env)->CallObjectMethod(env, application, get_class_loader);
     if (!class_loader) {
-        LOGE("Failed to get ClassLoader");
+        LOGE("Application.getClassLoader() returned null");
         return false;
     }
 
@@ -89,7 +102,7 @@ static bool setup_class_loader(JNIEnv* env) {
     g_load_class_method = (*env)->GetMethodID(
             env, class_loader_class, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
 
-    LOGI("ClassLoader setup complete");
+    LOGI("ClassLoader setup complete (via ActivityThread.currentApplication())");
     return true;
 }
 
@@ -223,11 +236,11 @@ static JavaClassWrapper* java_use(JNIEnv* env, const char* class_name) {
         return NULL;
     }
 
-    // Global reference al (wrapper'ın ömrü boyunca yaşasın)
+    // Take a global reference (it lives as long as the wrapper)
     jclass global_clazz = (jclass)(*env)->NewGlobalRef(env, clazz);
     (*env)->DeleteLocalRef(env, clazz);
 
-    // Wrapper oluştur
+    // Create the wrapper
     JavaClassWrapper* wrapper = (JavaClassWrapper*)malloc(sizeof(JavaClassWrapper));
     if (!wrapper) {
         (*env)->DeleteGlobalRef(env, global_clazz);
@@ -676,15 +689,153 @@ static int lua_java_register_class(lua_State* L) {
     return 1;
 }
 
+/* Real-world bug, found in the field (byte[] signing input
+ * for an RSA/HMAC-signed API request kept hashing to the same signature
+ * regardless of input): this function previously handled ONLY object
+ * arrays. For a primitive type name/descriptor ("byte", "[B", "int", ...),
+ * `find_class(env, class_name)` either failed outright ("byte" is not a
+ * resolvable class) or, for a descriptor like "[B", resolved to the *array*
+ * class itself -- which NewObjectArray then (mis)used as the *element*
+ * type, silently building a 2D byte[][] instead of a byte[], and the
+ * following loop only ever wrote elements when `lua_isuserdata()` was true
+ * (true for jobject wrappers, never for plain Lua numbers) -- so every
+ * primitive array came out either nil or all-zero. The field workaround was
+ * to build the array via `java.lang.reflect.Array.newInstance`/`setByte`
+ * by hand in Lua; this fixes it at the source instead.
+ *
+ * Primitive element types are now handled directly with the matching JNI
+ * New<Type>Array/Set<Type>ArrayElement calls. For "byte"/"[B" specifically,
+ * `data` may also be a Lua *string* (not just a table of numbers) -- the
+ * natural way to hand over a raw byte buffer (e.g. a signing input) without
+ * manually building a 256-entry number table first.
+ */
+typedef enum {
+    JARR_OBJECT, JARR_BYTE, JARR_INT, JARR_LONG, JARR_SHORT,
+    JARR_BOOLEAN, JARR_CHAR, JARR_FLOAT, JARR_DOUBLE
+} JavaArrayKind;
+
+static JavaArrayKind classify_array_kind(const char* name) {
+    if (strcmp(name, "byte") == 0 || strcmp(name, "[B") == 0) return JARR_BYTE;
+    if (strcmp(name, "int") == 0 || strcmp(name, "[I") == 0) return JARR_INT;
+    if (strcmp(name, "long") == 0 || strcmp(name, "[J") == 0) return JARR_LONG;
+    if (strcmp(name, "short") == 0 || strcmp(name, "[S") == 0) return JARR_SHORT;
+    if (strcmp(name, "boolean") == 0 || strcmp(name, "[Z") == 0) return JARR_BOOLEAN;
+    if (strcmp(name, "char") == 0 || strcmp(name, "[C") == 0) return JARR_CHAR;
+    if (strcmp(name, "float") == 0 || strcmp(name, "[F") == 0) return JARR_FLOAT;
+    if (strcmp(name, "double") == 0 || strcmp(name, "[D") == 0) return JARR_DOUBLE;
+    return JARR_OBJECT;
+}
+
 static int lua_java_array(lua_State* L) {
     const char* class_name = luaL_checkstring(L, 1);
-    luaL_checktype(L, 2, LUA_TTABLE);
 
     JNIEnv* env = get_jni_env();
     if (!env) {
         lua_pushnil(L);
         lua_pushstring(L, "Failed to get JNIEnv");
         return 2;
+    }
+
+    JavaArrayKind kind = classify_array_kind(class_name);
+
+    if (kind == JARR_BYTE && lua_type(L, 2) == LUA_TSTRING) {
+        size_t len;
+        const char* s = lua_tolstring(L, 2, &len);
+        jbyteArray arr = (*env)->NewByteArray(env, (jsize)len);
+        if (!arr) {
+            lua_pushnil(L);
+            lua_pushstring(L, "Failed to create byte array");
+            return 2;
+        }
+        /* (unsigned char) -> jbyte is the correct two's-complement
+         * reinterpretation (0..255 -> -128..127); no manual offset needed. */
+        (*env)->SetByteArrayRegion(env, arr, 0, (jsize)len, (const jbyte*)s);
+        jobject global = (*env)->NewGlobalRef(env, arr);
+        (*env)->DeleteLocalRef(env, arr);
+        jobject* result = (jobject*)lua_newuserdata(L, sizeof(jobject));
+        *result = global;
+        luaL_getmetatable(L, JAVA_INSTANCE_MT);
+        lua_setmetatable(L, -2);
+        return 1;
+    }
+
+    luaL_checktype(L, 2, LUA_TTABLE);
+    int len = luaL_len(L, 2);
+
+    if (kind != JARR_OBJECT) {
+        jarray arr = NULL;
+        switch (kind) {
+            case JARR_BYTE:    arr = (*env)->NewByteArray(env, len); break;
+            case JARR_INT:     arr = (*env)->NewIntArray(env, len); break;
+            case JARR_LONG:    arr = (*env)->NewLongArray(env, len); break;
+            case JARR_SHORT:   arr = (*env)->NewShortArray(env, len); break;
+            case JARR_BOOLEAN: arr = (*env)->NewBooleanArray(env, len); break;
+            case JARR_CHAR:    arr = (*env)->NewCharArray(env, len); break;
+            case JARR_FLOAT:   arr = (*env)->NewFloatArray(env, len); break;
+            case JARR_DOUBLE:  arr = (*env)->NewDoubleArray(env, len); break;
+            default: break; /* unreachable */
+        }
+        if (!arr) {
+            lua_pushnil(L);
+            lua_pushfstring(L, "Failed to create %s array", class_name);
+            return 2;
+        }
+
+        for (int i = 0; i < len; i++) {
+            lua_rawgeti(L, 2, i + 1);
+            switch (kind) {
+                case JARR_BYTE: {
+                    jbyte v = (jbyte)(int64_t)luaL_checkinteger(L, -1);
+                    (*env)->SetByteArrayRegion(env, (jbyteArray)arr, i, 1, &v);
+                    break;
+                }
+                case JARR_INT: {
+                    jint v = (jint)luaL_checkinteger(L, -1);
+                    (*env)->SetIntArrayRegion(env, (jintArray)arr, i, 1, &v);
+                    break;
+                }
+                case JARR_LONG: {
+                    jlong v = (jlong)luaL_checkinteger(L, -1);
+                    (*env)->SetLongArrayRegion(env, (jlongArray)arr, i, 1, &v);
+                    break;
+                }
+                case JARR_SHORT: {
+                    jshort v = (jshort)luaL_checkinteger(L, -1);
+                    (*env)->SetShortArrayRegion(env, (jshortArray)arr, i, 1, &v);
+                    break;
+                }
+                case JARR_BOOLEAN: {
+                    jboolean v = lua_toboolean(L, -1) ? JNI_TRUE : JNI_FALSE;
+                    (*env)->SetBooleanArrayRegion(env, (jbooleanArray)arr, i, 1, &v);
+                    break;
+                }
+                case JARR_CHAR: {
+                    jchar v = (jchar)luaL_checkinteger(L, -1);
+                    (*env)->SetCharArrayRegion(env, (jcharArray)arr, i, 1, &v);
+                    break;
+                }
+                case JARR_FLOAT: {
+                    jfloat v = (jfloat)luaL_checknumber(L, -1);
+                    (*env)->SetFloatArrayRegion(env, (jfloatArray)arr, i, 1, &v);
+                    break;
+                }
+                case JARR_DOUBLE: {
+                    jdouble v = (jdouble)luaL_checknumber(L, -1);
+                    (*env)->SetDoubleArrayRegion(env, (jdoubleArray)arr, i, 1, &v);
+                    break;
+                }
+                default: break; /* unreachable */
+            }
+            lua_pop(L, 1);
+        }
+
+        jobject global = (*env)->NewGlobalRef(env, arr);
+        (*env)->DeleteLocalRef(env, arr);
+        jobject* result = (jobject*)lua_newuserdata(L, sizeof(jobject));
+        *result = global;
+        luaL_getmetatable(L, JAVA_INSTANCE_MT);
+        lua_setmetatable(L, -2);
+        return 1;
     }
 
     jclass element_class = find_class(env, class_name);
@@ -694,7 +845,6 @@ static int lua_java_array(lua_State* L) {
         return 2;
     }
 
-    int len = luaL_len(L, 2);
     jobjectArray arr = (*env)->NewObjectArray(env, len, element_class, NULL);
     if (!arr) {
         lua_pushnil(L);
@@ -722,6 +872,151 @@ static int lua_java_array(lua_State* L) {
 }
 
 // Java.use("com.example.Class") -> JavaClassWrapper userdata
+//=============================================================================
+// Java.enumerateLoadedClasses()
+//=============================================================================
+//
+// Enumerates class NAMES loaded via the app's own context ClassLoader, by
+// walking BaseDexClassLoader -> DexPathList.dexElements[] -> Element.dexFile
+// -> DexFile.entries(). All field access below is via GetFieldID/
+// GetObjectField -- deliberately NOT java.lang.reflect.Field -- because
+// Android's hiddenapi policy only gates java.lang.reflect call sites;
+// plain JNI field access from native code is exempt, the same reason real
+// Frida uses this exact approach on Android instead of reflection. pathList/
+// dexElements/dexFile are private fields, which is fine for JNI the same
+// way it's fine everywhere else in this codebase (e.g. find_class()'s own
+// use of the context ClassLoader above).
+//
+// Deliberately NOT implemented in this pass: Java.choose() (enumerating
+// LIVE INSTANCES of a class). That needs ART garbage-collector heap
+// walking, not classloader/dex introspection -- a fundamentally different
+// and much higher-risk piece of work. Research done on a real device
+// (Android 15/API 35): libart.so DOES export
+// art::ClassLinker::VisitClasses (useful for a class-object visitor, which
+// this function doesn't even need, since Java.use() already resolves any
+// class NAME this returns into a usable wrapper) but does NOT export any
+// stable, directly-callable "visit every live object/instance of a class"
+// symbol in its dynamic symbol table -- only internal, ABI-fragile pieces
+// that vary across Android versions/OEM builds and would risk corrupting
+// or crashing the target if driven incorrectly from outside. The honest,
+// lower-risk alternative for a future pass: trigger
+// android.os.Debug.dumpHprofData() (a stable public API) and parse the
+// resulting heap dump host-side -- a static snapshot, not live references
+// usable for further calls like Frida's Java.choose(), but safe.
+static int lua_java_enumerate_loaded_classes(lua_State* L) {
+    JNIEnv* env = get_jni_env();
+    if (!env) {
+        lua_pushnil(L);
+        lua_pushstring(L, "Failed to get JNIEnv");
+        return 2;
+    }
+
+    if (!setup_class_loader(env)) {
+        lua_pushnil(L);
+        lua_pushstring(L, "Failed to resolve context ClassLoader");
+        return 2;
+    }
+
+    jclass dex_loader_class = (*env)->FindClass(env, "dalvik/system/BaseDexClassLoader");
+    if (!dex_loader_class || (*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        lua_pushnil(L);
+        lua_pushstring(L, "BaseDexClassLoader class not found");
+        return 2;
+    }
+
+    if (!(*env)->IsInstanceOf(env, g_class_loader, dex_loader_class)) {
+        lua_pushnil(L);
+        lua_pushstring(L, "Context ClassLoader is not a BaseDexClassLoader");
+        return 2;
+    }
+
+    jfieldID pathlist_field = (*env)->GetFieldID(env, dex_loader_class, "pathList", "Ldalvik/system/DexPathList;");
+    jclass pathlist_class = (*env)->FindClass(env, "dalvik/system/DexPathList");
+    if (!pathlist_field || !pathlist_class || (*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        lua_pushnil(L);
+        lua_pushstring(L, "DexPathList introspection failed");
+        return 2;
+    }
+
+    jobject path_list = (*env)->GetObjectField(env, g_class_loader, pathlist_field);
+    jfieldID elements_field = (*env)->GetFieldID(env, pathlist_class, "dexElements", "[Ldalvik/system/DexPathList$Element;");
+    if (!path_list || !elements_field || (*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        lua_pushnil(L);
+        lua_pushstring(L, "dexElements field not found");
+        return 2;
+    }
+
+    jobjectArray elements = (jobjectArray)(*env)->GetObjectField(env, path_list, elements_field);
+    if (!elements) {
+        lua_pushnil(L);
+        lua_pushstring(L, "dexElements is null");
+        return 2;
+    }
+
+    jclass element_class = (*env)->FindClass(env, "dalvik/system/DexPathList$Element");
+    jfieldID dexfile_field = element_class ? (*env)->GetFieldID(env, element_class, "dexFile", "Ldalvik/system/DexFile;") : NULL;
+    jclass dexfile_class = (*env)->FindClass(env, "dalvik/system/DexFile");
+    jmethodID entries_method = dexfile_class ? (*env)->GetMethodID(env, dexfile_class, "entries", "()Ljava/util/Enumeration;") : NULL;
+    if (!element_class || !dexfile_field || !dexfile_class || !entries_method || (*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        (*env)->DeleteLocalRef(env, elements);
+        lua_pushnil(L);
+        lua_pushstring(L, "DexFile.entries() introspection failed");
+        return 2;
+    }
+
+    jclass enum_class = (*env)->FindClass(env, "java/util/Enumeration");
+    jmethodID has_more = (*env)->GetMethodID(env, enum_class, "hasMoreElements", "()Z");
+    jmethodID next_elem = (*env)->GetMethodID(env, enum_class, "nextElement", "()Ljava/lang/Object;");
+
+    lua_newtable(L); // result array
+    int result_idx = 1;
+
+    jsize n_elements = (*env)->GetArrayLength(env, elements);
+    for (jsize i = 0; i < n_elements; i++) {
+        jobject element = (*env)->GetObjectArrayElement(env, elements, i);
+        if (!element) continue;
+
+        jobject dex_file = (*env)->GetObjectField(env, element, dexfile_field);
+        if (!dex_file) {
+            (*env)->DeleteLocalRef(env, element);
+            continue;
+        }
+
+        jobject enumeration = (*env)->CallObjectMethod(env, dex_file, entries_method);
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionClear(env);
+            (*env)->DeleteLocalRef(env, dex_file);
+            (*env)->DeleteLocalRef(env, element);
+            continue;
+        }
+
+        while (enumeration && (*env)->CallBooleanMethod(env, enumeration, has_more)) {
+            jstring class_name = (jstring)(*env)->CallObjectMethod(env, enumeration, next_elem);
+            if (class_name) {
+                const char* name = (*env)->GetStringUTFChars(env, class_name, NULL);
+                if (name) {
+                    lua_pushstring(L, name);
+                    lua_rawseti(L, -2, result_idx++);
+                    (*env)->ReleaseStringUTFChars(env, class_name, name);
+                }
+                (*env)->DeleteLocalRef(env, class_name);
+            }
+        }
+
+        if (enumeration) (*env)->DeleteLocalRef(env, enumeration);
+        (*env)->DeleteLocalRef(env, dex_file);
+        (*env)->DeleteLocalRef(env, element);
+    }
+
+    (*env)->DeleteLocalRef(env, elements);
+
+    return 1;
+}
+
 static int lua_java_use(lua_State* L) {
     const char* class_name = luaL_checkstring(L, 1);
 
@@ -768,7 +1063,11 @@ static int lua_java_new(lua_State* L) {
     ParsedSignature parsed = parse_signature(sig);
     lua_to_jvalue(env, L, &parsed, args, 3);
     
+    // Explicit script->target call, native hooks must be
+    // able to fire inside it (see hook_outcall_begin in native.c).
+    int outcall_prev = hook_outcall_begin();
     jobject instance = java_new(env, wrapper, sig, args);
+    hook_outcall_end(outcall_prev);
     if (!instance) {
         lua_pushnil(L);
         lua_pushstring(L, "Failed to create instance");
@@ -806,7 +1105,9 @@ static int lua_java_call_static(lua_State* L) {
     lua_to_jvalue(env,L,&parsed,args,4);
     
 
+    int outcall_prev = hook_outcall_begin(); // see lua_java_new
     jvalue result = call_static_method(env, wrapper, method_name, sig, args);
+    hook_outcall_end(outcall_prev);
 
 
 
@@ -872,7 +1173,9 @@ static int lua_java_call_instance(lua_State* L) {
     ParsedSignature parsed = parse_signature(sig);
     lua_to_jvalue(env,L,&parsed,args,4);
     
+    int outcall_prev = hook_outcall_begin(); // see lua_java_new
     jvalue result = call_instance_method(env, instance, method_name, sig, args);
+    hook_outcall_end(outcall_prev);
 
     switch (parsed.return_type) {
         case 'V':
@@ -1007,6 +1310,9 @@ void lua_register_java(lua_State* L) {
 
     lua_pushcfunction(L, lua_java_array);
     lua_setfield(L, -2, "array");
+
+    lua_pushcfunction(L, lua_java_enumerate_loaded_classes);
+    lua_setfield(L, -2, "enumerateLoadedClasses");
 
     lua_setglobal(L, "Java");
 

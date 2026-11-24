@@ -1,3 +1,4 @@
+#include <agent/hook_java.h>
 #include <agent/cmd_registry.h>
 #include <agent/globals.h>
 #include <agent/hook.h>
@@ -45,27 +46,68 @@ static int cmd_list_apps(int fd, const char* args) {
 
 static int cmd_hooks(int fd, const char* args) {
     (void)args;
-    char response[1024];
-    int len = snprintf(response, sizeof(response), "Active hooks: %d\n", g_hook_count);
+    // One line at a time. This used to format every hook into a single
+    // `char response[1024]` with `len += snprintf(response + len,
+    // sizeof(response) - len, ...)`: once the text outgrew the buffer the
+    // size argument wrapped around and the next snprintf wrote past the end
+    // of the stack buffer - with the hook table at 128 entries that takes
+    // only ~40 hooks. It also read the trampoline union member for every
+    // hook type, so PLT/GOT hooks were listed with a bogus target.
+    char line[96];
+    int len = snprintf(line, sizeof(line), "Active hooks: %d\n", g_hook_count);
+    write(fd, line, (size_t)len);
     for (int i = 0; i < g_hook_count; i++) {
-        if (g_hooks[i].data.trampoline.target_addr != NULL) {
-            len += snprintf(response + len, sizeof(response) - len,
-                "  [%d] target=%p\n", i, g_hooks[i].data.trampoline.target_addr);
+        bool installed = (g_hooks[i].type == HOOK_PLT_GOT)
+            ? (g_hooks[i].data.plt_got.patched_count > 0)
+            : (g_hooks[i].data.trampoline.target_addr != NULL);
+        if (installed) {
+            len = snprintf(line, sizeof(line), "  [%d] target=%p hits=%lu\n", i, g_hooks[i].logical_target_addr,
+                           __atomic_load_n(&g_hooks[i].hits, __ATOMIC_RELAXED));
         } else {
-            len += snprintf(response + len, sizeof(response) - len,
-                "  [%d] (removed)\n", i);
+            len = snprintf(line, sizeof(line), "  [%d] (removed)\n", i);
+        }
+        if (len > 0) write(fd, line, (size_t)len);
+    }
+
+    // Java method hooks have their own table and their own ids ("j0", ...).
+    // The section only appears when there are any.
+    if (g_java_hook_count > 0) {
+        char jline[512];
+        len = snprintf(jline, sizeof(jline), "Java hooks: %d\n", g_java_hook_count);
+        write(fd, jline, (size_t)len);
+        for (int i = 0; i < g_java_hook_count; i++) {
+            const JavaHookInfo* h = &g_java_hooks[i];
+            if (h->is_hooked) {
+                len = snprintf(jline, sizeof(jline), "  [j%d] %s.%s%s hits=%lu\n", i,
+                               h->class_name, h->method_name, h->method_sig,
+                               __atomic_load_n(&h->hits, __ATOMIC_RELAXED));
+            } else {
+                len = snprintf(jline, sizeof(jline), "  [j%d] (removed)\n", i);
+            }
+            if (len > 0) write(fd, jline, (size_t)(len < (int)sizeof(jline) ? len : (int)sizeof(jline) - 1));
         }
     }
-    write(fd, response, len);
     return 1;
 }
 
 static int cmd_unhook(int fd, const char* args) {
     if (!args || !*args || strcmp(args, "all") == 0) {
         int count = uninstall_all_hooks();
+        count += uninstall_all_java_hooks();
         char response[128];
         snprintf(response, sizeof(response), "Removed %d hook(s)\n", count);
         write(fd, response, strlen(response));
+    } else if (args[0] == 'j' && args[1] >= '0' && args[1] <= '9') {
+        int hook_id = atoi(args + 1);
+        if (hook_id < g_java_hook_count && g_java_hooks[hook_id].is_hooked &&
+            uninstall_java_hook(hook_id) == 0) {
+            char response[128];
+            snprintf(response, sizeof(response), "Hook j%d removed\n", hook_id);
+            write(fd, response, strlen(response));
+        } else {
+            const char* error = "ERROR: Failed to remove hook\n";
+            write(fd, error, strlen(error));
+        }
     } else {
         int hook_id = atoi(args);
         if (uninstall_hook(hook_id) == 0) {

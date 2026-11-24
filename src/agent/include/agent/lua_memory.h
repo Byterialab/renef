@@ -32,4 +32,7 @@ MemorySearchResult memory_search_pattern_in_lib(const char* libName, const int* 
 void free_search_result(MemorySearchResult* result);
 void register_memory_search_api(lua_State* L);
 
+/* Process.enumerateRanges() / Process.enumerateThreads() -- see api_memory.c */
+void register_process_api(lua_State* L);
+
 #endif

@@ -1,3 +1,6 @@
+#include <stdarg.h>
+#include <time.h>
+#include <agent/output_queue.h>
 #include <agent/hook_java.h>
 #include <agent/globals.h>
 #include <agent/agent.h>
@@ -21,18 +24,13 @@ static ArtMethodOffsets g_offsets = {0};
 static bool g_java_hook_initialized = false;
 static pthread_mutex_t g_java_hook_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Use recursive mutex to allow nested hook callbacks (parent calling child)
-static pthread_mutex_t g_java_lua_mutex;
-static pthread_once_t g_lua_mutex_init_once = PTHREAD_ONCE_INIT;
-
-static void init_recursive_lua_mutex(void) {
-    pthread_mutexattr_t attr;
-    pthread_mutexattr_init(&attr);
-    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-    pthread_mutex_init(&g_java_lua_mutex, &attr);
-    pthread_mutexattr_destroy(&attr);
-    LOGI("Initialized recursive Lua mutex for nested hooks");
-}
+// Java onEnter/onLeave callbacks below take the process-wide recursive
+// g_lua_vm_mutex (lua_vm_lock/lua_vm_unlock, globals.h) instead of a private
+// mutex. This used to be a separate g_java_lua_mutex, distinct from native.c's
+// own g_lua_mutex and unrelated to the (previously unlocked) script-exec path
+// in engine.c — three locks/non-locks guarding one shared lua_State. Sharing
+// one recursive lock here closes that gap and keeps supporting nested hook
+// callbacks (parent calling child) on the same thread.
 
 // Thread-local hook call stack for tracking nested calls
 #define MAX_HOOK_CALL_DEPTH 16
@@ -1496,6 +1494,93 @@ static uint64_t java_hook_call_original(int hook_index, uint64_t* saved_regs) {
     return result;
 }
 
+// Callbacks wait for the Lua VM, but not forever: a script that runs for a
+// long time (or a callback of another hook that is slow) would otherwise
+// hold up every thread that calls a hooked method - on the main thread
+// that is an ANR. After the timeout the call goes on without its callback,
+// and the skipped callbacks are reported, the same policy as native hooks.
+#define JAVA_CALLBACK_LOCK_TIMEOUT_MS 500
+
+static volatile unsigned long g_java_cb_skipped = 0;
+static volatile long g_java_cb_skip_reported_at = 0;
+
+static bool java_callback_lock(const JavaHookInfo* hook) {
+    if (lua_vm_lock_timed(JAVA_CALLBACK_LOCK_TIMEOUT_MS)) {
+        return true;
+    }
+    unsigned long total = __atomic_add_fetch(&g_java_cb_skipped, 1, __ATOMIC_RELAXED);
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long last = __atomic_load_n(&g_java_cb_skip_reported_at, __ATOMIC_RELAXED);
+    if (now.tv_sec - last >= 2 &&
+        __atomic_compare_exchange_n(&g_java_cb_skip_reported_at, &last, (long)now.tv_sec, false,
+                                    __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+        char msg[320];
+        int n = snprintf(msg, sizeof(msg),
+                         "[renef] %lu Java hook callback(s) skipped (last: %s.%s): Lua VM busy for >%dms "
+                         "(a script or another callback is still running)\n",
+                         total, hook->class_name, hook->method_name, JAVA_CALLBACK_LOCK_TIMEOUT_MS);
+        if (n > 0) {
+            LOGW("%s", msg);
+            output_queue_push(msg, (size_t)n);
+        }
+    }
+    return false;
+}
+
+void* java_libart_symbol(const char* name) {
+    static uintptr_t libart_base = 0;
+    if (!libart_base) {
+        FILE* fp = fopen("/proc/self/maps", "r");
+        if (!fp) return NULL;
+        char line[512];
+        while (fgets(line, sizeof(line), fp)) {
+            if (strstr(line, "/libart.so")) {
+                unsigned long start;
+                if (sscanf(line, "%lx-", &start) == 1 && (libart_base == 0 || start < libart_base)) {
+                    libart_base = start;
+                }
+            }
+        }
+        fclose(fp);
+    }
+    return libart_base ? find_symbol_in_mapped_elf(libart_base, name) : NULL;
+}
+
+static __thread char g_tls_last_error[256];
+
+const char* java_hook_last_error(void) {
+    return g_tls_last_error;
+}
+
+void java_hook_set_error(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_tls_last_error, sizeof(g_tls_last_error), fmt, ap);
+    va_end(ap);
+}
+
+static __thread char* g_tls_return_string = NULL;
+
+void java_hook_set_return_string(char* text) {
+    free(g_tls_return_string);
+    g_tls_return_string = text;
+}
+
+static __thread bool g_tls_skip_original = false;
+
+bool java_hook_skip_requested(void) {
+    return g_tls_skip_original;
+}
+
+void java_hook_abandon_call(void) {
+    if (g_hook_call_stack.depth > 0) {
+        g_hook_call_stack.depth--;
+        g_current_java_hook_index = g_hook_call_stack.depth > 0
+            ? g_hook_call_stack.hook_indices[g_hook_call_stack.depth - 1] : -1;
+    }
+}
+
 void java_hook_on_enter(int hook_index, uint64_t* saved_regs) {
     if (hook_index < 0 || hook_index >= g_java_hook_count) {
         LOGE("Invalid Java hook index: %d", hook_index);
@@ -1503,6 +1588,7 @@ void java_hook_on_enter(int hook_index, uint64_t* saved_regs) {
     }
 
     JavaHookInfo* hook = &g_java_hooks[hook_index];
+    __atomic_add_fetch(&hook->hits, 1, __ATOMIC_RELAXED);
 
     if (g_hook_call_stack.depth < MAX_HOOK_CALL_DEPTH) {
         g_hook_call_stack.hook_indices[g_hook_call_stack.depth] = hook_index;
@@ -1529,9 +1615,9 @@ void java_hook_on_enter(int hook_index, uint64_t* saved_regs) {
          (unsigned long long)x2, (unsigned long long)x3);
 
     hook->skip_original = false;
+    g_tls_skip_original = false;
 
-    if (hook->lua_onEnter_ref != LUA_NOREF && g_lua_engine) {
-        pthread_mutex_lock(&g_java_lua_mutex);
+    if (hook->lua_onEnter_ref != LUA_NOREF && g_lua_engine && java_callback_lock(hook)) {
         lua_State* L = lua_engine_get_state(g_lua_engine);
         if (L) {
             lua_rawgeti(L, LUA_REGISTRYINDEX, hook->lua_onEnter_ref);
@@ -1563,6 +1649,7 @@ void java_hook_on_enter(int hook_index, uint64_t* saved_regs) {
 
                 lua_getfield(L, -1, "skip");
                 if (lua_toboolean(L, -1)) {
+                    g_tls_skip_original = true;
                     hook->skip_original = true;
                     LOGI("  skip_original set by onEnter callback");
                 }
@@ -1586,7 +1673,7 @@ void java_hook_on_enter(int hook_index, uint64_t* saved_regs) {
 
             luaL_unref(L, LUA_REGISTRYINDEX, args_ref);
         }
-        pthread_mutex_unlock(&g_java_lua_mutex);
+        lua_vm_unlock();
     }
 }
 
@@ -1608,8 +1695,7 @@ uint64_t java_hook_on_leave(int hook_index, uint64_t ret_val) {
         LOGI("  String value: \"%s\"", hook->stored_string_value);
     }
 
-    if (hook->lua_onLeave_ref != LUA_NOREF && g_lua_engine) {
-        pthread_mutex_lock(&g_java_lua_mutex);
+    if (hook->lua_onLeave_ref != LUA_NOREF && g_lua_engine && java_callback_lock(hook)) {
         lua_State* L = lua_engine_get_state(g_lua_engine);
         if (L) {
             lua_rawgeti(L, LUA_REGISTRYINDEX, hook->lua_onLeave_ref);
@@ -1619,7 +1705,10 @@ uint64_t java_hook_on_leave(int hook_index, uint64_t ret_val) {
             lua_pushinteger(L, ret_val);
             lua_setfield(L, -2, "raw");
 
-            if (hook->has_stored_string && hook->stored_string_value) {
+            if (g_tls_return_string) {
+                lua_pushstring(L, g_tls_return_string);
+                lua_setfield(L, -2, "value");
+            } else if (hook->has_stored_string && hook->stored_string_value) {
                 lua_pushstring(L, hook->stored_string_value);
                 lua_setfield(L, -2, "value");
 
@@ -1700,8 +1789,10 @@ uint64_t java_hook_on_leave(int hook_index, uint64_t ret_val) {
                 lua_pop(L, 1);
             }
         }
-        pthread_mutex_unlock(&g_java_lua_mutex);
+        lua_vm_unlock();
     }
+
+    java_hook_set_return_string(NULL);
 
     if (g_hook_call_stack.depth > 0) {
         g_hook_call_stack.depth--;
@@ -1717,8 +1808,6 @@ uint64_t java_hook_on_leave(int hook_index, uint64_t ret_val) {
 
 
 int java_hook_init(JNIEnv* env) {
-    pthread_once(&g_lua_mutex_init_once, init_recursive_lua_mutex);
-
     if (g_java_hook_initialized) {
         return 0;
     }
@@ -1765,6 +1854,7 @@ int install_java_hook(JNIEnv* env,
     }
 
     java_hook_init(env);
+    java_hook_set_error("%s", "");
 
     pthread_mutex_lock(&g_java_hook_mutex);
 
@@ -1783,7 +1873,17 @@ int install_java_hook(JNIEnv* env,
         if (*p == '/') *p = '.';
     }
 
-    jclass clazz = (*env)->FindClass(env, class_name);
+    // FindClass wants slashes. A dotted name ("java.lang.String") is an
+    // error there, and with CheckJNI on - every debuggable app - that error
+    // aborts the process instead of returning NULL.
+    char jni_class_name[256];
+    strncpy(jni_class_name, class_name, sizeof(jni_class_name) - 1);
+    jni_class_name[sizeof(jni_class_name) - 1] = '\0';
+    for (char* p = jni_class_name; *p; p++) {
+        if (*p == '.') *p = '/';
+    }
+
+    jclass clazz = (*env)->FindClass(env, jni_class_name);
 
     if (!clazz || (*env)->ExceptionCheck(env)) {
         (*env)->ExceptionClear(env);
@@ -1844,6 +1944,7 @@ int install_java_hook(JNIEnv* env,
 
         if (!clazz || (*env)->ExceptionCheck(env)) {
             LOGE("Class not found via application ClassLoader: %s", java_class_name);
+            java_hook_set_error("class %s not found", java_class_name);
             (*env)->ExceptionDescribe(env);
             (*env)->ExceptionClear(env);
             pthread_mutex_unlock(&g_java_hook_mutex);
@@ -1866,6 +1967,7 @@ int install_java_hook(JNIEnv* env,
 
     if (!method_id) {
         LOGE("Method not found: %s.%s%s", class_name, method_name, signature);
+        java_hook_set_error("method %s%s not found in %s", method_name, signature, class_name);
         if ((*env)->ExceptionCheck(env)) {
             (*env)->ExceptionDescribe(env);
             (*env)->ExceptionClear(env);
@@ -1886,6 +1988,21 @@ int install_java_hook(JNIEnv* env,
     }
 
     LOGI("ArtMethod pointer: %p", art_method);
+
+    // Preferred engine: the method becomes a real JNI native method and the
+    // original runs through a copy (java_jni.c). Everything below is the
+    // original engine, kept for devices where that one cannot be set up.
+    {
+        int jni_index = java_jni_install(env, clazz, method_id, art_method, is_static,
+                                         class_name, method_name, signature,
+                                         onEnter_ref, onLeave_ref);
+        if (jni_index != -1) {
+            (*env)->DeleteLocalRef(env, clazz);
+            pthread_mutex_unlock(&g_java_hook_mutex);
+            return jni_index < 0 ? -1 : jni_index;
+        }
+        LOGW("JNI hook engine unavailable, using the trampoline engine for %s.%s", class_name, method_name);
+    }
 
     const ArtMethodOffsets* offsets = get_art_method_offsets();
 
@@ -2045,6 +2162,15 @@ int uninstall_java_hook(int hook_index) {
         return 0;
     }
 
+    if (hook->engine == JAVA_HOOK_ENGINE_JNI) {
+        if (java_jni_uninstall(hook_index) != 0) {
+            pthread_mutex_unlock(&g_java_hook_mutex);
+            return -1;
+        }
+        hook->hook_trampoline = NULL;   // owned by java_jni.c, never unmapped
+        goto release_callbacks;
+    }
+
     const ArtMethodOffsets* offsets = get_art_method_offsets();
     void** entry_point_ptr = (void**)((uintptr_t)hook->art_method + offsets->entry_point_offset);
 
@@ -2070,7 +2196,12 @@ int uninstall_java_hook(int hook_index) {
         hook->hook_trampoline = NULL;
     }
 
+release_callbacks:
+    // Same rationale as native.c's uninstall_hook(): this runs on the
+    // connection/command thread, outside any script's lua_pcall, so it must
+    // take the VM lock itself before touching the Lua registry.
     if (g_lua_engine) {
+        lua_vm_lock();
         lua_State* L = lua_engine_get_state(g_lua_engine);
         if (L) {
             if (hook->lua_onEnter_ref != LUA_NOREF) {
@@ -2080,6 +2211,7 @@ int uninstall_java_hook(int hook_index) {
                 luaL_unref(L, LUA_REGISTRYINDEX, hook->lua_onLeave_ref);
             }
         }
+        lua_vm_unlock();
     }
 
     hook->lua_onEnter_ref = LUA_NOREF;
