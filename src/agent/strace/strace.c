@@ -1,3 +1,4 @@
+#include <agent/output_queue.h>
 #include <agent/strace.h>
 #include <agent/globals.h>
 #include <agent/proc.h>
@@ -70,7 +71,14 @@ static __thread int g_strace_depth = 0;
 static __thread char g_strace_enter_buf[1024];
 static __thread uint64_t g_strace_skip_retval = 0;
 
-static pthread_mutex_t g_strace_lua_mutex = PTHREAD_MUTEX_INITIALIZER;
+// strace_on_enter/strace_on_return fire from a trampoline thunk on whatever
+// app thread made the traced syscall — the same situation as native hook
+// callbacks (native.c) and Java hook callbacks (java.c). This used to lock
+// its own private g_strace_lua_mutex, a fourth independent lock (alongside
+// native.c's, java.c's, and the formerly-unlocked engine.c script-exec path)
+// guarding the same shared lua_State. Use the single process-wide
+// lua_vm_lock()/lua_vm_unlock() (globals.h) instead so strace callbacks are
+// mutually exclusive with every other Lua entry point, not just each other.
 
 extern int g_output_client_fd;
 
@@ -216,6 +224,17 @@ static void format_arg(enum SyscallArgType type, uint64_t val, char* buf, size_t
 static void strace_output(const char* msg) {
     if (g_output_client_fd >= 0 && msg) {
         size_t len = strlen(msg);
+        if (output_queue_is_event_context()) {
+            // Trace lines are events: with an event channel they go there
+            // (as one message, so lines of different threads cannot mix)
+            // instead of into the reply of the next command.
+            char line[4096];
+            if (len > sizeof(line) - 1) len = sizeof(line) - 1;
+            memcpy(line, msg, len);
+            line[len] = '\n';
+            output_queue_push(line, len + 1);
+            return;
+        }
         write(g_output_client_fd, msg, len);
         write(g_output_client_fd, "\n", 1);
     }
@@ -277,7 +296,7 @@ int strace_on_enter(uint64_t* saved_regs) {
     g_strace_enter_buf[sizeof(g_strace_enter_buf) - 1] = '\0';
 
     if (entry->lua_onCall_ref != LUA_NOREF && g_lua_engine) {
-        pthread_mutex_lock(&g_strace_lua_mutex);
+        lua_vm_lock();
         lua_State* L = lua_engine_get_state(g_lua_engine);
         if (L) {
             /* push callback */
@@ -347,7 +366,7 @@ int strace_on_enter(uint64_t* saved_regs) {
 
             luaL_unref(L, LUA_REGISTRYINDEX, info_ref);
         }
-        pthread_mutex_unlock(&g_strace_lua_mutex);
+        lua_vm_unlock();
     }
 
     verbose_log("STRACE: %s", output);
@@ -383,7 +402,7 @@ uint64_t strace_on_return(uint64_t ret_val) {
     pid_t tid = (pid_t)syscall(SYS_gettid);
 
     if (entry->lua_onReturn_ref != LUA_NOREF && g_lua_engine) {
-        pthread_mutex_lock(&g_strace_lua_mutex);
+        lua_vm_lock();
         lua_State* L = lua_engine_get_state(g_lua_engine);
         if (L) {
             lua_rawgeti(L, LUA_REGISTRYINDEX, entry->lua_onReturn_ref);
@@ -412,7 +431,7 @@ uint64_t strace_on_return(uint64_t ret_val) {
                 lua_pop(L, 1);
             }
         }
-        pthread_mutex_unlock(&g_strace_lua_mutex);
+        lua_vm_unlock();
     }
 
     if (entry->lua_onCall_ref == LUA_NOREF) {

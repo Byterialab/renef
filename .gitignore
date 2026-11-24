@@ -16,3 +16,10 @@ external/lua/
 external/asio/
 external/capstone/
 examples/plugins/*.so
+examples/plugins/*.dylib
+examples/plugins/*.dll
+
+.DS_Store
+# Python bytecode
+__pycache__/
+*.pyc

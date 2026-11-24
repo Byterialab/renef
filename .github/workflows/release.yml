@@ -374,25 +374,29 @@ jobs:
           Dynamic Instrumentation Toolkit for Android ARM64
 
           ### What's New
-            - **AI Integration**: New \`ai\` command with multi-provider support (Ollama, OpenAI, Anthropic). Agentic tool calling lets the AI execute Renef commands to analyze the target before generating scripts. Use \`@path\` to inline file contents into prompts.
+            - **Hook output on its own channel**: what hooks and the syscall tracer print no longer ends up in front of the next command's reply. The server holds it until \`watch\` or \`events\` asks; every other command prints only its own result. \`hooks\` shows a \`hits=\` counter per hook.
 
-            - **Spawn Gate (\`--pause\`)**: New flag that freezes the target process after injection via SIGSTOP, ensuring hooks are installed before app initialization (e.g. root detection in onCreate). No ptrace, undetectable. New \`resume\` command for manual control.
+            - **Framed requests**: replies end exactly where they end. Large scripts are delivered intact (the 64 KB limit is gone), late replies are no longer mixed up, and \`exec\` / \`rpc\` take \`--timeout\`.
 
-            - **Python Binding Update**: Added \`OS\`, \`File\`, \`Syscall\`, \`KCov\` wrappers, \`watch_start/stop\`, fixed \`basic.py\` example, 54 unit tests.
+            - **Native hook engine reworked**: one-instruction patch, correct relocation of PC-relative instructions, execute-only code, 128 hooks per session, and hooks on functions the agent itself uses (\`malloc\`, \`write\`, ...).
 
-            - **OS API**: New \`OS\` global with \`getpid()\`, \`kill()\`, \`tgkill()\`, \`listdir()\`.
+            - **Java hooks rebuilt (Android 12+)**: a hooked method that throws, or a garbage collection at the wrong moment, no longer crashes the app. \`float\`/\`double\` and stack arguments work, Java hooks are listed in \`hooks\` and removable with \`unhook\`.
 
-            - **Connection Stability and Hook Memory Fix**: Stealth hooking via \`/proc/self/mem\`, connection liveness probe, auto-reconnect on send failure.
+            - **Python client rewritten**: pure Python, talks to \`renef_server\` directly, no native library, works on macOS and Linux.
 
-            - **Strace API**: Programmatic syscall tracing from Lua scripts via \`Syscall.trace()\`. Also available as standalone \`renef-strace\` binary — a ptrace-free syscall tracer using PLT/GOT hooking. Supports per-syscall \`onCall\`/\`onReturn\` callbacks, argument mutation, skip original, and category-based tracing (file, net, process).
+            - **New Lua APIs**: \`Interceptor.replace\` / \`Interceptor.revert\`, \`NativeFunction\` with \`float\`/\`double\`, async hooks, \`send(table)\` events, \`Module.disassemble\`, \`Process.enumerateRanges\` / \`enumerateThreads\`, \`Java.enumerateLoadedClasses\`, hooks on libraries that are not loaded yet.
 
-            - **KCOV Feature**: Kernel code coverage collection via \`KCov.open()\` for coverage-guided fuzzing. Tracks which kernel code paths are hit during syscalls.
+            - **New commands**: \`rpc\`, \`events\`, \`exec --json\`, \`memdump\` (read a process without injecting), \`mcp\`, \`plugin\` / \`format\`, \`--headless\` and \`--timeout\` for pipelines.
 
-            - **Hexdump API**: Frida-style \`hexdump()\` for memory addresses, strings, byte tables and hook arguments. Also available as \`Memory.hexdump()\`.
+            - **Injection through a code cave**: only one instruction of \`malloc()\` changes while the agent loads.
 
-            - **Hook Auto-Cleanup**: All hooks are automatically uninstalled when the client disconnects.
+            - **Plugins and recipes**: new plugin types with JSON results, and ready-to-run scripts in \`scripts/recipes/\` (SSL pinning, root / Frida / emulator detection, taint filter, engine capture, reflection dump).
 
-            - **Release Workflow**: Added \`renef-strace\` and \`client-android\` (on-device ARM64 client) to build and release packages.
+            - **Fixed**: \`hookn\`, \`ms\` on devices with Mali GPUs, \`watch\` under continuous output, \`hooks\` with many hooks installed, \`Syscall.trace("openat")\`, commands containing \`//\`.
+
+          Full release notes and known limitations: https://renef.io (Release Notes, v${VERSION}).
+
+          ### Commits
           ${COMMITS}
 
           ### Downloads

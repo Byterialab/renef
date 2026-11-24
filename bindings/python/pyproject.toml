@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "renef"
+description = "Python client for Renef, a dynamic instrumentation toolkit for Android ARM64"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+dynamic = ["version"]
+dependencies = []
+
+[tool.setuptools]
+packages = ["renef"]
+
+[tool.setuptools.dynamic]
+version = { attr = "renef.__version__" }

@@ -25,6 +25,7 @@
 struct SpawnParams {
   std::string pkg_name;
   bool pause = false;
+  bool hold = false;   // with --pause: keep the gate until an explicit `resume`
 };
 
 static SpawnParams parse_spawn_params(const char *cmd_buffer, size_t cmd_size) {
@@ -74,6 +75,10 @@ static SpawnParams parse_spawn_params(const char *cmd_buffer, size_t cmd_size) {
   if (args.find("--pause") != std::string::npos) {
     params.pause = true;
     remove_flag("--pause");
+  }
+  if (args.find("--hold") != std::string::npos) {
+    params.hold = true;
+    remove_flag("--hold");
   }
 
   size_t start = args.find_first_not_of(" \t");
@@ -196,6 +201,7 @@ public:
         // for it. On ptrace_resume, main thread runs, lib loads, poll
         // catches it, hook installed before first call.
         CommandRegistry::instance().gated_pid = pid;
+        CommandRegistry::instance().gate_hold = params.hold;
         std::cerr << "  [spawn-gate] main thread frozen (pid=" << pid
                   << "), will resume on first exec/load" << std::endl;
       }

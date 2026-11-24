@@ -1,6 +1,8 @@
 #include <iostream>
 #include <string>
 #include <cstring>
+#include <cstdlib>
+#include <cstdint>
 #include <vector>
 #include <map>
 #include <chrono>
@@ -41,8 +43,36 @@ static int g_gadget_pid = 0;
 static std::string g_gadget_key;
 static std::unique_ptr<ITransport> g_gadget_transport;
 static bool g_verbose_mode = false;
-#define DEFAULT_TCP_PORT 1907
+static int g_timeout_seconds = 0;    // --timeout <seconds>: 0 = disabled
+static bool g_headless_mode = false; // --headless
+// Machine-readable output mode, prototyped on the `exec`
+// command only (cmd_eval.cpp) before spreading to other cmd_*.cpp files.
+// When set: eval_cmd gets an "--json " prefix (so cmd_eval.cpp emits one
+// JSON object instead of streaming raw agent text) and response printing
+// skips ANSI color wrapping, so stdout is clean enough to pipe into e.g. jq.
+static bool g_json_mode = false;     // --json
+#define DEFAULT_TCP_PORT renef_host_port()   // RENEF_PORT or 1907 (server_connection.h)
 #define DEFAULT_UDS_PATH "@com.android.internal.os.RuntimeInit"
+
+// ─── Headless/batch exit codes
+//
+// These are returned from main() when running with --headless (and/or
+// --timeout). Exit code 1 is left as the pre-existing generic/legacy error
+// code already used elsewhere in this file; the codes below are new and
+// specific to the batch-runner paths added for --headless/--timeout.
+static constexpr int EXIT_RENEF_OK = 0;
+// No device / can't reach renef_server / "spawn"/"attach" command itself
+// failed (response did not start with "OK").
+static constexpr int EXIT_RENEF_CONNECT_FAILED = 2;
+// The agent reported that the Lua script failed to compile or run
+// ("ERROR: Lua execution failed" from src/agent/handlers/eval.c). This is
+// also the fallback for hook-install failures we cannot positively identify
+// (see exit_code_for_script_failure() below for why).
+static constexpr int EXIT_RENEF_SCRIPT_ERROR = 3;
+// Best-effort refinement of EXIT_RENEF_SCRIPT_ERROR: only used when a
+// logcat scan corroborates that the failure was specifically hook()
+// install failing (api_hook.c's "Failed to install native/Java hook").
+static constexpr int EXIT_RENEF_HOOK_FAILED = 4;
 
 static std::map<std::string, std::vector<std::pair<std::string, std::string>>> lua_api = {
     {"Module", {
@@ -619,11 +649,21 @@ bool check_adb_devices(std::string& device_id) {
 }
 
 bool setup_adb_forward(const std::string& device_id) {
+    // RENEF_ADB_FORWARD=off: the forward is the user's business - e.g. a
+    // server started with `--transport TCP` (reached with `adb forward
+    // tcp:<port> tcp:1907`), which is what a device needs whose SELinux
+    // policy keeps adbd away from the server's abstract socket.
+    const char* manage = getenv("RENEF_ADB_FORWARD");
+    if (manage && (!strcmp(manage, "off") || !strcmp(manage, "0") || !strcmp(manage, "no"))) {
+        return true;
+    }
+
     std::string forward_cmd = "adb";
     if (!device_id.empty()) {
         forward_cmd += " -s " + device_id;
     }
-    forward_cmd += " forward tcp:1907 localabstract:com.android.internal.os.RuntimeInit";
+    forward_cmd += " forward tcp:" + std::to_string(DEFAULT_TCP_PORT) +
+                   " localabstract:com.android.internal.os.RuntimeInit";
 
     int ret = system(forward_cmd.c_str());
     if (ret != 0) {
@@ -787,6 +827,51 @@ bool check_quit_key() {
     return false;
 }
 
+// Wire-level note (see src/agent/lua/engine.c's send() comment for the
+// agent-side half): Lua's send({...}) tags its JSON line with the literal
+// prefix "[event] " on the *same* line-oriented agent output stream that
+// console.log()/print() already use -- no new transport message type was
+// added. Here on the host we only need to make those lines stand out:
+//   - Interactively: print them in a distinct color so a human scanning
+//     the terminal can immediately tell a structured finding apart from
+//     ordinary script log output.
+//   - In --headless mode: they still go through this same function (see
+//     send_command() below, which prints unconditionally, independent of
+//     g_headless_mode), so a pipeline capturing stdout sees the same
+//     "[event] {...}" lines and can grep/parse them without a TTY.
+// This only reformats text already destined for stdout; it does not
+// change what bytes arrive from the device or how any other command's
+// output (e.g. `{"success":...}` JSON) is parsed.
+static void print_response_with_event_highlighting(const std::string& text, const std::string& normal_color) {
+    static const char* EVENT_TAG = "[event] ";
+
+    // --json: no ANSI color wrapping, so a cmd_eval.cpp JSON line (or
+    // any other response) comes out of the CLI clean enough to pipe to jq.
+    if (g_json_mode) {
+        std::cout << text;
+        std::cout.flush();
+        return;
+    }
+
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t nl = text.find('\n', pos);
+        size_t line_end = (nl == std::string::npos) ? text.size() : nl;
+        bool has_nl = (nl != std::string::npos);
+
+        std::string line = text.substr(pos, line_end - pos);
+        if (line.rfind(EVENT_TAG, 0) == 0) {
+            std::cout << BOLDMAGENTA << line << RESET;
+        } else {
+            std::cout << normal_color << line << RESET;
+        }
+        if (has_nl) std::cout << "\n";
+
+        pos = has_nl ? line_end + 1 : line_end;
+    }
+    std::cout.flush();
+}
+
 std::string send_command(const std::string& command) {
     if (g_gadget_mode && g_gadget_transport && g_gadget_transport->is_connected()) {
         std::string full_cmd = g_gadget_key + " " + command + "\n";
@@ -813,8 +898,7 @@ std::string send_command(const std::string& command) {
 
         if (!response.empty()) {
             ColorManager& cm = ColorManager::instance();
-            std::cout << cm.response_color << response << RESET;
-            std::cout.flush();
+            print_response_with_event_highlighting(response, cm.response_color);
         }
         return response;
     }
@@ -837,7 +921,7 @@ std::string send_command(const std::string& command) {
                 std::cerr << "Error: Cannot connect to server\n";
                 std::cerr << "\nMake sure:\n";
                 std::cerr << "1. renef_server is running on Android device\n";
-                std::cerr << "2. adb forward is set: adb forward tcp:1907 localabstract:com.android.internal.os.RuntimeInit\n";
+                std::cerr << "2. adb forward is set: adb forward tcp:" << DEFAULT_TCP_PORT << " localabstract:com.android.internal.os.RuntimeInit\n";
             }
         }
         if (!connected) {
@@ -846,6 +930,47 @@ std::string send_command(const std::string& command) {
     }
 
     bool streaming = is_streaming_command(command);
+
+    // Framed request when the server supports it.
+    // The response ends at the server's completion marker for THIS
+    // request, not at "10s for the first byte, then 50ms of quiet" - which
+    // returned early on any output that paused, and handed a late reply to
+    // whichever command was typed next. No drain needed either: a stale
+    // reply is skipped by id (and hook output waiting on the socket is no
+    // longer thrown away by that drain).
+    if (!streaming && conn.supports_framing()) {
+        // Wait a bit longer than the server waits for the agent
+        // (renef_agent_request::DEFAULT_SILENCE_TIMEOUT_MS = 30s, or the
+        // command's own "--timeout <seconds>").
+        int wait_ms = 35000;
+        size_t tpos = command.find("--timeout ");
+        if (tpos != std::string::npos && tpos < 16) {
+            int secs = std::atoi(command.c_str() + tpos + 10);
+            if (secs > 0) wait_ms = (secs + 5) * 1000;
+        }
+
+        bool completed = false;
+        std::string framed_response = conn.request(command, wait_ms, &completed);
+        ColorManager& fcm = ColorManager::instance();
+        if (!framed_response.empty()) {
+            print_response_with_event_highlighting(framed_response, fcm.response_color);
+        } else if (completed) {
+            // Command completed and wrote nothing.
+        }
+        if (!completed) {
+            std::cout << "(no completion from server within " << (wait_ms / 1000) << "s)\n";
+        }
+        // Hook and trace output is kept out of command replies; say that
+        // some is waiting instead of printing it in front of this reply.
+        // On stderr, so it never becomes part of a command's output.
+        unsigned long pending = completed ? conn.pending_events() : 0;
+        if (pending > 0 && !g_headless_mode && command.rfind("events", 0) != 0) {
+            std::cout.flush();
+            std::cerr << "(" << pending << " line" << (pending == 1 ? "" : "s")
+                      << " of hook output waiting - `watch` shows them)\n";
+        }
+        return framed_response;
+    }
 
     // Drain any stale data from previous commands — but NOT when starting
     // a streaming command (watch/strace). Hook output may arrive between
@@ -874,7 +999,14 @@ std::string send_command(const std::string& command) {
     ColorManager& cm = ColorManager::instance();
 
     if (streaming) {
-        // Streaming mode: loop with short timeout, check for 'q' key
+        // Streaming mode: loop with short timeout, check for 'q' key.
+        // In --headless mode there's no TTY to press 'q' on, so this is
+        // also bounded by --timeout when one was given (used by the
+        // headless auto-watch drain below, so async/hook-triggered
+        // send()/print() output reaching the agent during the --timeout
+        // window still gets relayed to stdout instead of sitting unread
+        // in the agent<->server socket until the process exits).
+        auto stream_start = std::chrono::steady_clock::now();
         while (true) {
             if (check_quit_key()) {
                 std::cout << "\nExiting watch mode...\n";
@@ -883,10 +1015,31 @@ std::string send_command(const std::string& command) {
                 break;
             }
 
-            std::string chunk = conn.receive(100);
+            if (g_headless_mode && g_timeout_seconds > 0) {
+                auto elapsed = std::chrono::steady_clock::now() - stream_start;
+                if (elapsed >= std::chrono::seconds(g_timeout_seconds)) {
+                    conn.send("q\n");
+                    conn.receive(500);
+                    break;
+                }
+            }
+
+            std::string chunk = conn.receive_some(100);
+            if (!conn.is_connected()) {
+                if (!chunk.empty()) print_response_with_event_highlighting(chunk, cm.response_color);
+                std::cout << "\n(connection to server lost)\n";
+                break;
+            }
             if (!chunk.empty()) {
-                std::cout << cm.response_color << chunk << RESET;
-                std::cout.flush();
+                // Printed per-chunk for responsiveness; a "[event] ..."
+                // line that happens to straddle two chunks won't be
+                // recognized as an event on the second chunk (it won't
+                // start with the tag) and just prints as plain text. The
+                // non-streaming branch below (used by -l/--headless script
+                // loads, where send() events actually matter for the
+                // pipeline use case) reads the full response first, so it
+                // doesn't have this limitation.
+                print_response_with_event_highlighting(chunk, cm.response_color);
                 full_response += chunk;
             }
         }
@@ -895,8 +1048,7 @@ std::string send_command(const std::string& command) {
         full_response = conn.receive(10000);
 
         if (!full_response.empty()) {
-            std::cout << cm.response_color << full_response << RESET;
-            std::cout.flush();
+            print_response_with_event_highlighting(full_response, cm.response_color);
         } else {
             std::cout << "(no response)\n";
         }
@@ -953,6 +1105,180 @@ static std::string send_command_silent(const std::string& command) {
     if (marker != std::string::npos) result = result.substr(0, marker);
 
     return result;
+}
+
+// ─── Host-side thin layer for the passive, injection-free memdump command ──
+// This is NOT a new agent/protocol path — it just
+// sends the existing-transport text command "memdump <pid> ..." to
+// renef_server (same ServerConnection used by send_command()) and, unlike
+// the interactive REPL, decodes the hex payload and writes the raw bytes to
+// a local host file. The actual /proc/<pid>/mem reading happens entirely on
+// the server/device side (see src/librenef/cmd/cmd_memdump_passive.cpp);
+// this function never touches an agent connection and never attaches to
+// anything itself.
+
+static bool memdump_hex_decode(const std::string& hex, std::vector<uint8_t>& out) {
+    if (hex.size() % 2 != 0) return false;
+    out.clear();
+    out.reserve(hex.size() / 2);
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+        if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+        return -1;
+    };
+    for (size_t i = 0; i < hex.size(); i += 2) {
+        int hi = nib(hex[i]);
+        int lo = nib(hex[i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out.push_back((uint8_t)((hi << 4) | lo));
+    }
+    return true;
+}
+
+static int run_memdump_passive(const std::string& pid_str, const std::string& range,
+                                bool maps_mode, const std::string& out_path, int port_override = 0) {
+    ServerConnection& conn = ServerConnection::instance();
+
+    if (!conn.is_connected()) {
+        bool connected;
+        if (g_local_mode) {
+            connected = conn.connect(DEFAULT_UDS_PATH, 0);
+        } else {
+            connected = conn.connect("127.0.0.1", port_override > 0 ? port_override : DEFAULT_TCP_PORT);
+        }
+        if (!connected) {
+            std::cerr << "ERROR: Cannot connect to renef_server\n";
+            return 1;
+        }
+    }
+
+    std::string cmd = "memdump " + pid_str + " " + (maps_mode ? std::string("--maps") : range);
+    std::cout << "[*] -> " << cmd << " (no injection, no agent, no ptrace)\n";
+
+    if (!conn.send(cmd + "\n")) {
+        std::cerr << "ERROR: Failed to send memdump command\n";
+        return 1;
+    }
+
+    std::string full_response;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    bool done = false;
+    while (!done && std::chrono::steady_clock::now() < deadline) {
+        std::string chunk = conn.receive(2000);
+        if (chunk.empty()) {
+            if (!full_response.empty()) break;
+            continue;
+        }
+        full_response += chunk;
+        if (full_response.find("MEMDUMP_END") != std::string::npos ||
+            full_response.find("MEMDUMP_ERROR") != std::string::npos) {
+            done = true;
+        }
+    }
+
+    if (full_response.empty()) {
+        std::cerr << "ERROR: No response from server (unknown command? old renef_server binary "
+                      "without the memdump command?)\n";
+        return 1;
+    }
+
+    std::istringstream iss(full_response);
+    std::string line;
+    std::vector<uint8_t> file_bytes;
+    int segments_ok = 0, segments_err = 0;
+    std::string server_hash;
+    bool saw_error = false;
+    std::string error_reason;
+    std::vector<std::string> maps_lines;
+    bool is_maps = maps_mode;
+
+    while (std::getline(iss, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+
+        if (line.rfind("MEMDUMP_ERROR", 0) == 0) {
+            saw_error = true;
+            error_reason = line;
+        } else if (line.rfind("MEMDUMP_MAPS", 0) == 0) {
+            is_maps = true;
+            std::cout << line << "\n";
+        } else if (line.rfind("MEMDUMP_MANIFEST", 0) == 0) {
+            std::cout << line << "\n";
+        } else if (line.rfind("SEG OK", 0) == 0) {
+            segments_ok++;
+            size_t hp = line.find("hex=");
+            if (hp != std::string::npos) {
+                std::vector<uint8_t> bytes;
+                if (memdump_hex_decode(line.substr(hp + 4), bytes)) {
+                    file_bytes.insert(file_bytes.end(), bytes.begin(), bytes.end());
+                }
+            }
+        } else if (line.rfind("SEG ERR", 0) == 0) {
+            segments_err++;
+            std::cout << line << "\n";
+        } else if (line.rfind("MEMDUMP_SUMMARY", 0) == 0) {
+            std::cout << line << "\n";
+            size_t hp = line.find("hash=");
+            if (hp != std::string::npos) server_hash = line.substr(hp + 5);
+        } else if (line.rfind("MEMDUMP_END", 0) == 0) {
+            break;
+        } else if (is_maps) {
+            maps_lines.push_back(line);
+            std::cout << line << "\n";
+        }
+    }
+
+    if (saw_error) {
+        std::cerr << "ERROR: " << error_reason << "\n";
+        return 1;
+    }
+
+    if (is_maps) {
+        if (!out_path.empty()) {
+            std::ofstream of(out_path);
+            for (const auto& l : maps_lines) of << l << "\n";
+            std::cout << "[*] Wrote " << maps_lines.size() << " map lines to " << out_path << "\n";
+        }
+        std::cout << "[*] " << maps_lines.size() << " range(s) listed (no injection, no ptrace)\n";
+        return 0;
+    }
+
+    // Range mode: recompute the same FNV-1a 64 fingerprint the server used,
+    // over the bytes we actually decoded, to catch transport corruption.
+    uint64_t local_hash = 0xcbf29ce484222325ull;
+    for (uint8_t b : file_bytes) {
+        local_hash ^= b;
+        local_hash *= 0x100000001b3ull;
+    }
+    std::ostringstream lh;
+    lh << std::hex << local_hash;
+    bool hash_ok = !server_hash.empty() && server_hash == lh.str();
+
+    if (!out_path.empty()) {
+        std::ofstream of(out_path, std::ios::binary);
+        of.write(reinterpret_cast<const char*>(file_bytes.data()), (std::streamsize)file_bytes.size());
+        of.close();
+
+        std::string manifest_path = out_path + ".manifest.txt";
+        std::ofstream mf(manifest_path);
+        mf << "pid=" << pid_str << "\n";
+        mf << "range=" << range << "\n";
+        mf << "bytes_written=" << file_bytes.size() << "\n";
+        mf << "segments_ok=" << segments_ok << "\n";
+        mf << "segments_err=" << segments_err << "\n";
+        mf << "server_hash=" << server_hash << "\n";
+        mf << "host_recomputed_hash=" << lh.str() << "\n";
+        mf << "hash_match=" << (hash_ok ? "true" : "false") << "\n";
+        mf.close();
+
+        std::cout << "[*] Wrote " << file_bytes.size() << " bytes to " << out_path << "\n";
+        std::cout << "[*] Manifest: " << manifest_path << "\n";
+    }
+
+    std::cout << "[*] segments_ok=" << segments_ok << " segments_err=" << segments_err
+               << " hash_match=" << (hash_ok ? "yes" : "no") << "\n";
+
+    return (segments_ok > 0) ? 0 : 1;
 }
 
 // ─── Client-side AI command (multi-provider) ─────────────────────
@@ -1397,6 +1723,50 @@ static bool handle_ai_command(const std::string& raw_prompt) {
     return true;
 }
 
+// Classify a script-execution failure for --headless exit codes.
+//
+// Honest limitation: the only signal the agent sends back over the wire for
+// a failed `exec` is the generic string "ERROR: Lua execution failed\n"
+// (src/agent/handlers/eval.c:handle_eval). That single string covers Lua
+// compile errors, Lua runtime errors, AND hook()-install failures (api_hook.c
+// raises a Lua error via luaL_error() when a hook can't be installed, which
+// lua_pcall in src/agent/lua/engine.c catches and only logs locally via LOGI
+// — it never puts the actual error text on the socket). So the host CLI has
+// no reliable, protocol-level way to tell "hook install failed" apart from
+// any other Lua error.
+//
+// As a best-effort (NOT guaranteed) refinement, when we're talking to a real
+// Android device over adb (not --local / not gadget mode) we scan the
+// recent `adb logcat` ring buffer for the agent's own "Failed to install
+// native/Java hook" log line (tag RENEF_AGENT). This can miss the failure
+// if the logcat ring buffer has rotated, if `adb` isn't on PATH, or if the
+// device filters logcat — in all of those cases we fall back to the
+// generic EXIT_RENEF_SCRIPT_ERROR, which is always correct, just less
+// specific.
+static int exit_code_for_script_failure(bool local_mode, bool gadget_mode) {
+    if (local_mode || gadget_mode) {
+        // No adb round-trip available in these modes.
+        return EXIT_RENEF_SCRIPT_ERROR;
+    }
+
+    FILE* pipe = popen("adb logcat -d -t 300 -s RENEF_AGENT:I 2>/dev/null", "r");
+    if (!pipe) {
+        return EXIT_RENEF_SCRIPT_ERROR;
+    }
+
+    bool hook_install_failed = false;
+    char line[512];
+    while (fgets(line, sizeof(line), pipe)) {
+        if (strstr(line, "Failed to install native hook") ||
+            strstr(line, "Failed to install Java hook")) {
+            hook_install_failed = true;
+        }
+    }
+    pclose(pipe);
+
+    return hook_install_failed ? EXIT_RENEF_HOOK_FAILED : EXIT_RENEF_SCRIPT_ERROR;
+}
+
 int main(int argc, char *argv[]) {
     std::string device_id;
     std::string script_file;
@@ -1405,6 +1775,14 @@ int main(int argc, char *argv[]) {
     bool view_mode = false;
     bool watch_mode = false;
     bool pause_mode = false;
+
+    // Passive, injection-free memdump: --memdump-pid selects the
+    // target without ever attaching/spawning/injecting into it.
+    std::string memdump_pid;
+    std::string memdump_range;
+    bool memdump_maps = false;
+    std::string memdump_out;
+    int memdump_port = 0; // 0 = use DEFAULT_TCP_PORT; override for testing against a non-default server
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -1446,6 +1824,31 @@ int main(int argc, char *argv[]) {
         else if (arg == "-v" || arg == "--verbose") {
             g_verbose_mode = true;
         }
+        else if (arg == "--timeout" && i + 1 < argc) {
+            g_timeout_seconds = std::atoi(argv[++i]);
+            if (g_timeout_seconds < 0) g_timeout_seconds = 0;
+        }
+        else if (arg == "--headless") {
+            g_headless_mode = true;
+        }
+        else if (arg == "--json") {
+            g_json_mode = true;
+        }
+        else if (arg == "--memdump-pid" && i + 1 < argc) {
+            memdump_pid = argv[++i];
+        }
+        else if (arg == "--memdump-range" && i + 1 < argc) {
+            memdump_range = argv[++i];
+        }
+        else if (arg == "--memdump-maps") {
+            memdump_maps = true;
+        }
+        else if (arg == "--out" && i + 1 < argc) {
+            memdump_out = argv[++i];
+        }
+        else if (arg == "--memdump-port" && i + 1 < argc) {
+            memdump_port = std::stoi(argv[++i]);
+        }
         else if (arg == "-h" || arg == "--help") {
             std::cout << "Usage: " << argv[0] << " [options]\n";
             std::cout << "Options:\n";
@@ -1460,6 +1863,16 @@ int main(int argc, char *argv[]) {
             std::cout << "  -w, --watch              Auto-watch hook output after loading script\n";
             std::cout << "  -p, --pause              Freeze app after spawn until script is loaded (spawn gate)\n";
             std::cout << "  -v, --verbose            Enable verbose mode (show agent debug logs)\n";
+            std::cout << "  --timeout <seconds>      Auto-detach and exit after N seconds (watchdog)\n";
+            std::cout << "  --headless               Skip the interactive shell: load -l script (if any) and wait\n";
+            std::cout << "                           (respects --timeout; without it, waits until Ctrl+C)\n";
+            std::cout << "  --memdump-pid <pid>      Passive, injection-free memory read of <pid> via\n";
+            std::cout << "                           renef_server's /proc/<pid>/mem (no spawn/attach,\n";
+            std::cout << "                           no ptrace, no agent). Pairs with --memdump-range\n";
+            std::cout << "                           or --memdump-maps, and --out.\n";
+            std::cout << "  --memdump-range <s>-<e>  Hex address range to read (with --memdump-pid)\n";
+            std::cout << "  --memdump-maps           List /proc/<pid>/maps instead of reading bytes\n";
+            std::cout << "  --out <path>             Host file to write memdump output/manifest to\n";
             std::cout << "  -h, --help               Show this help\n";
             std::cout << "\nExamples:\n";
             std::cout << "  " << argv[0] << " -s com.example.app -l script.lua -w\n";
@@ -1467,7 +1880,16 @@ int main(int argc, char *argv[]) {
             std::cout << "  " << argv[0] << " -a 1234 --hook=pltgot -l hook.lua\n";
             std::cout << "  " << argv[0] << " --local -s com.example.app    # On-device usage\n";
             std::cout << "  " << argv[0] << " -g 12345 -l hook.lua          # Gadget mode (rootless)\n";
+            std::cout << "  " << argv[0] << " --memdump-pid 12345 --memdump-maps --out maps.txt\n";
+            std::cout << "  " << argv[0] << " --memdump-pid 12345 --memdump-range 7f1000-7f2000 --out dump.bin\n";
             std::cout << "  " << argv[0] << " -m v -s com.example.app       # TUI mode\n";
+            std::cout << "  " << argv[0] << " -s com.example.app -l script.lua --headless --timeout 30\n";
+            std::cout << "                                 # CI/batch: run for up to 30s, exit with a status code\n";
+            std::cout << "\nExit codes (headless/batch mode):\n";
+            std::cout << "  0  OK (script ran / timeout-based clean detach)\n";
+            std::cout << "  2  Could not connect to the device/server, or spawn/attach failed\n";
+            std::cout << "  3  Lua script failed to compile or run on the target\n";
+            std::cout << "  4  Hook install failed (best-effort; falls back to 3 when not detectable)\n";
             return 0;
         }else if(arg == "--local"){
             // Local mode: connect directly via UDS, skip ADB
@@ -1507,7 +1929,7 @@ int main(int argc, char *argv[]) {
                 std::cerr << "  2. ADB forward is set: adb forward tcp:" << DEFAULT_TCP_PORT
                           << " localabstract:renef_pl_" << g_gadget_pid << "\n";
             }
-            return 1;
+            return EXIT_RENEF_CONNECT_FAILED;
         }
 
         struct timeval tv;
@@ -1546,22 +1968,57 @@ int main(int argc, char *argv[]) {
         g_device_ready = true;
     }
 
+    // Headless, injection-free passive memdump. Runs and exits —
+    // never falls through to spawn/attach/interactive shell, since the whole
+    // point is not touching the target process at all.
+    if (!memdump_pid.empty()) {
+        if (!memdump_maps && memdump_range.empty()) {
+            std::cerr << "ERROR: --memdump-pid requires --memdump-range <start>-<end> or --memdump-maps\n";
+            return 1;
+        }
+        return run_memdump_passive(memdump_pid, memdump_range, memdump_maps, memdump_out, memdump_port);
+    }
+
     std::cout << "\nRENEF Interactive Shell\n";
     std::cout << "Type 'help' for commands, 'q' to exit.\n\n";
 
     auto& registry = CommandRegistry::instance();
     registry.setup_all_commands();
 
-    // Auto-load plugins from ~/.config/renef/plugins
-    plugin_autoload(nullptr);
+    // Auto-load plugins from ~/.config/renef/plugins.
+    // P2 fix: used to call plugin_autoload(nullptr), so every autoloaded
+    // plugin's ren_plugin_init() ran with ctx == nullptr -- it could never
+    // see the registry/socket_helper. Build the same kind of real context a
+    // manually-loaded plugin gets (see PluginCommandDispatcher::dispatch /
+    // the `plugin load` CLI subcommand in cmd_plugin.cpp) and pass that
+    // instead. There's no live client connection yet at this point in
+    // startup, so client_fd points at stdout.
+    static int autoload_stdout_fd = STDOUT_FILENO;
+    renef_ctx autoload_ctx;
+    autoload_ctx.client_fd = &autoload_stdout_fd;
+    autoload_ctx.socket_helper = &registry.get_socket_helper();
+    autoload_ctx.command_registry = &registry;
+    autoload_ctx.target_pid = nullptr;
+    plugin_autoload(&autoload_ctx);
 
-    // Register plugins command (client-only)
+    // Register plugin management commands (client-only; plugins are
+    // host-side, renef_server has no plugin support -- see below where
+    // "plugin"/"plugins" input is intercepted before being forwarded to
+    // the device).
     extern std::unique_ptr<CommandDispatcher> create_plugins_command();
+    extern std::unique_ptr<CommandDispatcher> create_plugin_command();
+    extern std::unique_ptr<CommandDispatcher> create_format_command();
     registry.register_command(create_plugins_command());
+    registry.register_command(create_plugin_command());
+    registry.register_command(create_format_command());
 
     global_commands = registry.get_all_commands_with_descriptions();
 
     bool auto_started = g_gadget_mode;  // Gadget mode: agent already running
+    // Set once an auto-watch relay (see "watch" in is_streaming_command())
+    // has already run to completion for this invocation, so the
+    // --headless wait block below doesn't start a second, redundant one.
+    bool headless_watch_done = false;
     if (!attach_pid.empty() || !spawn_app.empty()) {
         // Ensure device is connected for CLI spawn/attach
         if (!g_device_ready) {
@@ -1577,7 +2034,7 @@ int main(int argc, char *argv[]) {
                 }
             } else {
                 std::cerr << "ERROR: No ADB device connected. Cannot spawn/attach.\n";
-                return 1;
+                return EXIT_RENEF_CONNECT_FAILED;
             }
         }
 
@@ -1623,6 +2080,9 @@ int main(int argc, char *argv[]) {
             }
         } else {
             std::cerr << "[ERROR] Failed to start process\n";
+            if (g_headless_mode) {
+                return EXIT_RENEF_CONNECT_FAILED;
+            }
         }
     }
 
@@ -1632,17 +2092,48 @@ int main(int argc, char *argv[]) {
         std::string lua_code = read_lua_file(script_file);
         if (lua_code.empty()) {
             std::cerr << "[ERROR] Cannot read file: " << script_file << "\n";
+            if (g_headless_mode) {
+                return EXIT_RENEF_SCRIPT_ERROR;
+            }
         } else {
-            std::string eval_cmd = "exec " + lua_code;
+            std::string eval_cmd = "exec " + std::string(g_json_mode ? "--json " : "") + lua_code;
             std::string response = send_command(eval_cmd);
 
-            if (!response.empty()) {
-            }
+            // Best-effort script result detection. The agent only ever
+            // echoes back one of a small set of literal strings over the
+            // wire for `exec` (src/agent/handlers/eval.c, cmd_eval.cpp on
+            // the server side just forwards those bytes) — we scan for them
+            // here. See exit_code_for_script_failure() for the known limits
+            // of this signal.
+            bool lost_connection = response.find("ERROR: No target PID set") != std::string::npos ||
+                                   response.find("ERROR: Failed to connect to agent") != std::string::npos;
+            // In --json mode cmd_eval.cpp reports failure via "ok":false in
+            // its single JSON line instead of the free-text marker above.
+            bool script_failed = g_json_mode
+                ? response.find("\"ok\":false") != std::string::npos
+                : response.find("ERROR: Lua execution failed") != std::string::npos;
+
             std::cout << "[*] Script loaded\n";
 
             if (watch_mode) {
                 std::cout << "\n[Auto-watch enabled - Press 'q' to exit]\n";
                 send_command("watch");
+                // In headless mode this already ran the relay loop to
+                // completion (bounded by --timeout, see the streaming
+                // branch of send_command() above) -- don't start a second
+                // one below.
+                if (g_headless_mode) headless_watch_done = true;
+            }
+
+            if (g_headless_mode) {
+                if (lost_connection) {
+                    std::cerr << "[ERROR] Lost connection to agent while loading script\n";
+                    return EXIT_RENEF_CONNECT_FAILED;
+                }
+                if (script_failed) {
+                    std::cerr << "[ERROR] Script failed to execute on target\n";
+                    return exit_code_for_script_failure(g_local_mode, g_gadget_mode);
+                }
             }
         }
     }
@@ -1651,8 +2142,86 @@ int main(int argc, char *argv[]) {
         if (pause_mode && script_file.empty()) {
             std::cout << "\n[*] Process is paused. Type 'resume' to continue or 'l <script>' to load a script.\n";
         }
-        std::cout << "\n[*] Interactive shell ready\n";
-        std::cout << "[*] You can run commands or enter Lua code\n\n";
+        if (!g_headless_mode) {
+            std::cout << "\n[*] Interactive shell ready\n";
+            std::cout << "[*] You can run commands or enter Lua code\n\n";
+        }
+    }
+
+    // --headless: everything that would normally happen interactively
+    // (spawn/attach, -l script load) already ran above. From here we just
+    // wait — bounded by --timeout if given, otherwise until Ctrl+C — and
+    // exit instead of dropping into the readline REPL/TUI.
+    //
+    // send() note: a script's send()/print() calls made *during* the
+    // `exec` above are already captured (send_command() prints the full
+    // response unconditionally, see print_response_with_event_highlighting
+    // above). But hooks can also fire asynchronously, any time after exec
+    // returns -- e.g. while the target app is used during this wait
+    // window -- and that output only reaches the host once something
+    // actively relays the agent<->server socket (see cmd_watch.cpp). So
+    // when we have a live target and haven't already started that relay
+    // via -w/--watch above, drive it here too (bounded by --timeout, or
+    // indefinitely like the previous plain-sleep behavior when no
+    // --timeout was given) instead of blindly sleeping, so a pipeline
+    // capturing stdout also sees events/log lines that fire mid-run, not
+    // just the ones from the initial script body.
+    if (g_headless_mode) {
+        if (headless_watch_done) {
+            // -w/--watch already drove the relay (bounded by --timeout)
+            // to completion above; nothing more to wait for.
+            if (g_timeout_seconds > 0) {
+                std::cout << "[*] Timeout (" << g_timeout_seconds << "s) reached, detaching...\n";
+            }
+        } else if (auto_started) {
+            // No -w flag, but we do have a live target: drive the same
+            // relay here so hook-triggered output arriving during the
+            // wait window is still captured (see the comment above).
+            if (g_timeout_seconds > 0) {
+                std::cout << "[*] Headless mode: running for up to " << g_timeout_seconds
+                          << "s, then auto-detaching...\n";
+            } else {
+                std::cout << "[*] Headless mode: no --timeout given, waiting indefinitely (Ctrl+C to stop)...\n";
+            }
+            send_command("watch");
+            if (g_timeout_seconds > 0) {
+                std::cout << "[*] Timeout (" << g_timeout_seconds << "s) reached, detaching...\n";
+            }
+        } else if (g_timeout_seconds > 0) {
+            // No target was ever attached/spawned -- nothing to relay.
+            std::cout << "[*] Headless mode: running for up to " << g_timeout_seconds
+                      << "s, then auto-detaching...\n";
+            std::this_thread::sleep_for(std::chrono::seconds(g_timeout_seconds));
+            std::cout << "[*] Timeout (" << g_timeout_seconds << "s) reached, detaching...\n";
+        } else {
+            std::cout << "[*] Headless mode: no --timeout given, waiting indefinitely (Ctrl+C to stop)...\n";
+            while (true) {
+                std::this_thread::sleep_for(std::chrono::hours(1));
+            }
+        }
+        // Clean exit: same as the interactive 'q' path below — just return
+        // from main(), which runs normal static/global destructors
+        // (ServerConnection, g_gadget_transport, ...) and closes sockets.
+        return EXIT_RENEF_OK;
+    }
+
+    // --timeout without --headless: enforce the same bounded lifetime on
+    // top of the normal interactive shell (readline REPL or TUI below).
+    // The main thread is about to block in readline()/TuiApp::run(), so the
+    // timeout is enforced from a separate watchdog thread, matching the
+    // concurrency style already used elsewhere in this codebase (detached
+    // worker threads, e.g. deferred_poll_thread on the agent side).
+    // Caveat: this calls std::exit() from a background thread, which runs
+    // normal static-destructor cleanup but does NOT restore the terminal's
+    // raw mode that readline() may have set — same caveat as killing the
+    // process externally (e.g. SIGTERM) while at the prompt.
+    if (g_timeout_seconds > 0) {
+        std::thread([]() {
+            std::this_thread::sleep_for(std::chrono::seconds(g_timeout_seconds));
+            std::cout << "\n[*] Timeout (" << g_timeout_seconds << "s) reached, detaching...\n";
+            std::cout.flush();
+            std::exit(EXIT_RENEF_OK);
+        }).detach();
     }
 
 #ifdef RENEF_HAS_TUI
@@ -1877,6 +2446,31 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
+        // Plugin management is host-only -- renef_server has no plugin
+        // support at all (plugin.cpp/cmd_plugin.cpp aren't in SERVER_SRCS),
+        // so "plugin"/"plugins" must never be forwarded over the socket to
+        // the device like a regular command. Dispatch locally against this
+        // process's own CommandRegistry instead (same pattern the TUI's
+        // command_adapter.cpp uses).
+        if (command == "plugins" || command == "plugin" || command.rfind("plugin ", 0) == 0) {
+            static int plugin_stdout_fd = STDOUT_FILENO;
+            registry.dispatch(plugin_stdout_fd, command.c_str(), command.size());
+            free(input);
+            continue;
+        }
+
+        // "format <format_name> <command...>" (cmd_plugin.cpp) is also
+        // host-only -- it runs <command...> through this process's own
+        // CommandRegistry::dispatch_fixed() and hands the captured output to
+        // a loaded PLUGIN_FORMATTER plugin. Same local-dispatch rationale as
+        // "plugin"/"plugins" above: it must not be forwarded to the device.
+        if (command == "format" || command.rfind("format ", 0) == 0) {
+            static int format_stdout_fd = STDOUT_FILENO;
+            registry.dispatch(format_stdout_fd, command.c_str(), command.size());
+            free(input);
+            continue;
+        }
+
         auto load_result = preprocess_load_command(command);
         if (!load_result.exec_cmds.empty()) {
             for (const auto& exec_cmd : load_result.exec_cmds) {
@@ -1929,28 +2523,42 @@ int main(int argc, char *argv[]) {
         }
 
         if (!is_known_command && processed_cmd.rfind("exec ", 0) != 0) {
-            processed_cmd = "exec " + command;
+            processed_cmd = "exec " + std::string(g_json_mode ? "--json " : "") + command;
         }
 
-        // Check if command is handled by a plugin (not built-in server commands)
+        // Check if command is handled by a plugin (not built-in server commands).
+        //
+        // Previously this called plugin->exec() directly (bypassing
+        // CommandRegistry entirely) and duplicated the result_json relay
+        // here. That had a real behavioral gap: a claim-model plugin (one
+        // exporting ren_plugin_want -- e.g. an audit-trail logger meant
+        // to see EVERY command) never got a chance to claim a command typed
+        // directly in the interactive shell if that command happened to also
+        // be another plugin's fixed name (like "redex") -- plugin_find()
+        // above would match the fixed-name plugin first and this block
+        // would short-circuit before the claim-model check in
+        // CommandRegistry::dispatch() ever ran. Found while consolidating
+        // this with the other call sites.
+        // registry.dispatch() does the claim-check-then-fixed-name lookup
+        // (cmd.cpp) and already includes the result_json relay for both paths, so
+        // this now just delegates instead of re-implementing it.
         RENPlugin* plugin = plugin_find(cmd_name.c_str());
         if (plugin && plugin->exec) {
             static int stdout_fd = STDOUT_FILENO;
+            registry.dispatch(stdout_fd, command.c_str(), command.size());
+            free(input);
+            continue;
+        }
 
-            renef_ctx ctx;
-            ctx.client_fd = &stdout_fd;
-            ctx.socket_helper = nullptr;
-            ctx.command_registry = nullptr;
-            ctx.target_pid = nullptr;
-
-            // Get args after command name
-            std::string args;
-            size_t space = command.find(' ');
-            if (space != std::string::npos) {
-                args = command.substr(space + 1);
-            }
-
-            plugin->exec(&ctx, args.empty() ? nullptr : const_cast<char*>(args.c_str()));
+        // "mcp" is host-tooling-only (it spawns a
+        // LOCAL MCP server subprocess via /bin/sh -- meaningless if
+        // relayed to the Android device like every other built-in
+        // command). Dispatch it in-process on the host's own
+        // CommandRegistry instead of falling through to send_command()'s
+        // normal device-relay path.
+        if (cmd_name == "mcp") {
+            static int mcp_stdout_fd = STDOUT_FILENO;
+            registry.dispatch(mcp_stdout_fd, command.c_str(), command.size());
             free(input);
             continue;
         }

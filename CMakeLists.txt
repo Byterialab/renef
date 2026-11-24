@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(renef VERSION 0.3.7)
+project(renef VERSION 0.4.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -98,7 +98,12 @@ add_library(renef_core STATIC
     src/librenef/cmd/cmd_hooks.cpp
     src/librenef/cmd/cmd_sec.cpp
     src/librenef/cmd/cmd_memdump.cpp
+    src/librenef/cmd/cmd_memdump_passive.cpp
     src/librenef/cmd/cmd_hookgen.cpp
+    src/librenef/cmd/cmd_rpc.cpp
+    src/librenef/cmd/cmd_events.cpp
+    src/librenef/cmd/cmd_mcp.cpp
+    src/librenef/mcp/mcp_client.cpp
     src/librenef/cmd/cmd_inspect.cpp
     src/librenef/cmd/cmd_list.cpp
     src/librenef/cmd/cmd_plugin.cpp
@@ -143,6 +148,13 @@ target_link_libraries(renef_core PUBLIC
 # Capstone AArch64 compat: ensures CS_ARCH_ARM64 is available in newer capstone versions
 target_compile_definitions(renef_core PUBLIC CAPSTONE_AARCH64_COMPAT_HEADER)
 
+# renef_core links src/librenef/plugin/plugin.cpp, so
+# it can see plugin_find_claim()/ren_dispatch() from cmd.cpp's claim-model
+# check. The on-device renef_server (built separately via Makefile's
+# SERVER_SRCS) deliberately does NOT link plugin.cpp and must NOT define
+# this -- see the comment above the renef/plugin.h include in cmd.cpp.
+target_compile_definitions(renef_core PUBLIC RENEF_HAS_PLUGINS)
+
 # Shared library for Python/FFI bindings
 add_library(renef_shared SHARED
     src/librenef/binding/renef.cpp
@@ -165,7 +177,7 @@ target_link_libraries(renef_shared PUBLIC capstone)
 target_compile_definitions(renef_shared PUBLIC CAPSTONE_AARCH64_COMPAT_HEADER)
 set_target_properties(renef_shared PROPERTIES
     OUTPUT_NAME "renef"
-    VERSION 0.3.7
+    VERSION 0.4.0
     SOVERSION 0
 )
 

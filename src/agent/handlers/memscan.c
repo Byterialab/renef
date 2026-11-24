@@ -11,6 +11,19 @@ static size_t hex_to_bytes(const char* hex, unsigned char* out, size_t max_len) 
     size_t hex_len = strlen(hex);
     size_t byte_len = hex_len / 2;
 
+    // Only complete pairs of hex digits are a pattern. Anything else used
+    // to leave `out` partly unset, and the scan then ran with whatever the
+    // stack held ("ms zz" reported a thousand matches).
+    if (hex_len == 0 || (hex_len % 2) != 0) {
+        return 0;
+    }
+    for (size_t i = 0; i < hex_len; i++) {
+        char ch = hex[i];
+        if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F'))) {
+            return 0;
+        }
+    }
+
     if (byte_len > max_len) {
         byte_len = max_len;
     }

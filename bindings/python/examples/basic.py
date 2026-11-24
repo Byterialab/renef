@@ -1,55 +1,60 @@
 #!/usr/bin/env python3
 """
-Basic usage example for renef Python binding
+Basic usage of the renef Python client.
 
 Prerequisites:
-    1. Build: cd build && cmake .. && make renef_shared
-    2. Deploy: make deploy
-    3. Start server: adb shell /data/local/tmp/renef_server &
-    4. Forward port: adb forward tcp:1907 localabstract:com.android.internal.os.RuntimeInit
+    1. make install                      (server + agent on the device)
+    2. adb shell su -c /data/local/tmp/renef_server &
+    3. adb forward tcp:1907 localabstract:com.android.internal.os.RuntimeInit
+
+Usage:
+    python basic.py com.example.app
 """
 
-import sys
 import os
+import sys
 
-# Add parent directory to path for local development
+# Allow running from a checkout without installing the package.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from renef import Renef
+import renef
+
 
 def main():
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <package_name|pid>")
-        return 1
+    if len(sys.argv) != 2:
+        sys.exit("usage: basic.py <package>")
 
-    target = sys.argv[1]
-    r = Renef()
+    client = renef.connect()
+    with client.spawn(sys.argv[1]) as s:
+        print("[+] spawned, pid %d" % s.pid)
 
-    if target.isdigit():
-        print(f"[*] Attaching to PID {target}...")
-        session = r.attach(int(target))
-    else:
-        print(f"[*] Spawning {target}...")
-        session = r.spawn(target)
+        libc = s.Module.find("libc.so")
+        print("[+] libc.so at 0x%x, starts with %r" % (libc, s.Memory.read(libc, 4)))
+        print("[+] %d exports in libc.so" % len(s.Module.exports("libc.so")))
 
-    if not session:
-        print("[-] Failed to create session")
-        return 1
+        # Lua in the target, value back as Python data.
+        info = s.rpc("{pid = OS.getpid(), tid = Thread.id()}")
+        print("[+] rpc: %r" % (info,))
 
-    print(f"[+] Connected, PID: {session.pid}")
+        # A Python callback on every open(). The path string only exists
+        # while the call is running, so it is captured in the target
+        # (`capture`) and arrives with the event.
+        def on_open(event):
+            print("    open(%r) on thread %d" % (event.data.get("path"), event.thread_id))
 
-    # Test eval
-    ok, out, err = session.eval("print('Hello from Python!')")
-    print(f"[*] Eval output: {out}")
+        hook = s.hook("libc.so", "open", on_enter=on_open,
+                      capture={"path": "Memory.readStr(args[0])"})
+        print("[+] watching open() for 3 seconds...")
+        s.poll(wait=3)
+        hook.remove()
 
-    # Find libc
-    libc = session.Module.find("libc.so")
-    if libc:
-        print(f"[+] libc.so @ 0x{libc:x}")
+        # Lua-source callback: runs in the target and may change the result.
+        s.hook("libc.so", "getppid", on_leave="return 4242")
+        getppid = s.native_function(s.Module.find_export("libc.so", "getppid"), "int")
+        print("[+] getppid() through the hook: %d" % getppid())
 
-    session.close()
-    print("[+] Done")
-    return 0
+    print("[+] done")
+
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

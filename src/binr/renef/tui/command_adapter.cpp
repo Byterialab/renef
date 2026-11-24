@@ -67,7 +67,7 @@ void CommandAdapter::execute_async(const std::string& command,
 std::string CommandAdapter::execute_server(const std::string& command) {
     auto& conn = ServerConnection::instance();
     if (!conn.is_connected()) {
-        if (!conn.connect()) {
+        if (!conn.connect("127.0.0.1", renef_host_port())) {
             return "ERROR: Not connected to server\n";
         }
     }

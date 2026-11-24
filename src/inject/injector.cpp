@@ -1,6 +1,7 @@
 #include "shellcode.h"
 #include <chrono>
 #include <cstring>
+#include <cstdlib>
 #include <fcntl.h>
 #include <iostream>
 #include <sys/mman.h>
@@ -73,6 +74,25 @@ typedef struct {
   Elf64_Addr st_value;
   Elf64_Xword st_size;
 } Elf64_Sym;
+
+// Program header (used by find_code_cave).
+typedef struct {
+  Elf64_Word p_type;
+  Elf64_Word p_flags;
+  Elf64_Off p_offset;
+  Elf64_Addr p_vaddr;
+  Elf64_Addr p_paddr;
+  Elf64_Xword p_filesz;
+  Elf64_Xword p_memsz;
+  Elf64_Xword p_align;
+} Elf64_Phdr;
+
+#ifndef PT_LOAD
+#define PT_LOAD 1
+#endif
+#ifndef PF_X
+#define PF_X 1
+#endif
 
 #endif // __linux__
 
@@ -368,6 +388,282 @@ int create_memfd_from_file(const char *so_path) {
   return memfd;
 }
 
+
+// ---------------------------------------------------------------------------
+// Code-cave injection
+//
+// The original scheme writes the whole stage-1 shellcode (196 bytes) over
+// the beginning of malloc() and later writes the original bytes back.
+// Every thread that calls malloc() meanwhile loops INSIDE those bytes
+// waiting for the lock, and the restore is only safe if all of them have
+// been moved back to malloc+0 first. That was done by time: write `b .`
+// at malloc+0, sleep 30ms, restore. A thread that simply does not get
+// scheduled during those 30ms (seen live: a low-priority "Jit thread
+// pool" thread, and once the main thread, during a busy app start)
+// resumes in the middle of the restored, original malloc() with the wrong
+// registers -> SIGSEGV around malloc+44. Nothing short of knowing every
+// thread's PC makes a multi-instruction restore safe, and that needs
+// ptrace.
+//
+// So do not put more than ONE instruction into malloc(). Stage 1 goes into
+// unused zero padding after the end of libc's executable segment (same
+// mapping, so within reach of a plain `B`), and malloc+0 becomes a single
+// `B cave`. A one-word write is atomic for the threads executing it, in
+// both directions. Waiting threads loop inside the cave; when injection is
+// done their loop slots are rewritten to `B malloc`, which is correct no
+// matter when - or how late - each of them runs again. No sleeps, no
+// timing assumptions.
+// ---------------------------------------------------------------------------
+
+static uint32_t arm64_b(uintptr_t from, uintptr_t to) {
+  int64_t delta = (int64_t)to - (int64_t)from;
+  return 0x14000000u | (uint32_t)((delta >> 2) & 0x03FFFFFF);
+}
+
+static std::vector<uint8_t> le32_words(const std::vector<uint32_t> &words) {
+  std::vector<uint8_t> out(words.size() * 4);
+  memcpy(out.data(), words.data(), out.size());
+  return out;
+}
+
+// Returns the address of `need` unused (zero) bytes located after the end
+// of the executable PT_LOAD segment that contains `near_addr`, still
+// inside the same executable mapping of the target. 0 if there is none.
+static uintptr_t find_code_cave(int pid, const char *lib_path,
+                                uintptr_t lib_base, uintptr_t near_addr,
+                                size_t need) {
+  // 1) End of the executable segment, from the ELF program headers.
+  uint64_t seg_end_vaddr = 0;
+  {
+    int fd = open(lib_path, O_RDONLY);
+    if (fd < 0) return 0;
+    Elf64_Ehdr eh;
+    if (pread(fd, &eh, sizeof(eh), 0) != (ssize_t)sizeof(eh) ||
+        memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0 ||
+        eh.e_phentsize != sizeof(Elf64_Phdr)) {
+      close(fd);
+      return 0;
+    }
+    uint64_t rel = near_addr - lib_base;
+    for (int i = 0; i < eh.e_phnum; i++) {
+      Elf64_Phdr ph;
+      if (pread(fd, &ph, sizeof(ph), eh.e_phoff + (off_t)i * sizeof(ph)) !=
+          (ssize_t)sizeof(ph))
+        break;
+      if (ph.p_type == PT_LOAD && (ph.p_flags & PF_X) && rel >= ph.p_vaddr &&
+          rel < ph.p_vaddr + ph.p_memsz) {
+        seg_end_vaddr = ph.p_vaddr + ph.p_memsz;
+        break;
+      }
+    }
+    close(fd);
+  }
+  if (!seg_end_vaddr) return 0;
+
+  // 2) The executable mapping that contains near_addr.
+  uintptr_t map_start = 0, map_end = 0;
+  {
+    char maps_path[64];
+    snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+    FILE *maps = fopen(maps_path, "r");
+    if (!maps) return 0;
+    char line[512];
+    while (fgets(line, sizeof(line), maps)) {
+      unsigned long long s = 0, e = 0;
+      char perms[8] = {0};
+      if (sscanf(line, "%llx-%llx %7s", &s, &e, perms) != 3) continue;
+      if (near_addr >= s && near_addr < e && perms[2] == 'x') {
+        map_start = (uintptr_t)s;
+        map_end = (uintptr_t)e;
+        break;
+      }
+    }
+    fclose(maps);
+  }
+  if (!map_end) return 0;
+
+  // Leave a 16-byte gap after the last real instruction.
+  uintptr_t cave = lib_base + ((seg_end_vaddr + 15) & ~(uint64_t)15) + 16;
+  if (cave < map_start || cave + need > map_end) return 0;
+
+  // Must really be unused: all zero bytes right now.
+  auto cur = read_memory(pid, cave, need);
+  if (cur.size() != need) return 0;
+  for (uint8_t b : cur) {
+    if (b != 0) return 0;
+  }
+  return cave;
+}
+
+// Pre-lock part of stage 1 = its first 6 instructions (spin-lock on the
+// shared variable). A thread can only be inside these while it has NOT
+// taken the lock, i.e. while it has not touched sp or saved anything, so
+// sending it back to malloc+0 from any of the six slots is always correct.
+static const size_t STAGE1_PRELOCK_WORDS = 6;
+
+static std::vector<uint8_t> cave_back_to_malloc(uintptr_t cave,
+                                                uintptr_t malloc_addr) {
+  std::vector<uint32_t> words;
+  for (size_t i = 0; i < STAGE1_PRELOCK_WORDS; i++) {
+    words.push_back(arm64_b(cave + i * 4, malloc_addr));
+  }
+  return le32_words(words);
+}
+
+static void restore_cave_later(int pid, uintptr_t cave,
+                               std::vector<uint8_t> expected_head,
+                               std::vector<uint8_t> original) {
+  auto task = [pid, cave, expected_head, original]() {
+    // By now every thread that was parked in the cave has been sent back
+    // to malloc() the moment it ran. The delay is not what makes that
+    // safe (the `B malloc` slots are); it only decides how long the
+    // padding stays modified before it is put back to zeros.
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    // Same process, same cave contents we left? (pid may be gone/reused.)
+    auto now = read_memory(pid, cave, expected_head.size());
+    if (now != expected_head) return;
+    write_memory(pid, cave, original);
+  };
+#ifdef BUILD_STANDALONE_AGENT
+  task(); // the standalone injector exits right after inject() returns
+#else
+  std::thread(task).detach();
+#endif
+}
+
+static bool inject_via_code_cave(int pid, uintptr_t malloc_addr,
+                                 uintptr_t timezone_addr, uintptr_t cave,
+                                 const std::vector<uint8_t> &stage1,
+                                 const std::vector<uint8_t> &stage2,
+                                 const char *so_path) {
+  std::cout << "  ✓ Code cave: 0x" << std::hex << cave << std::dec << " ("
+            << stage1.size() << "B, single-instruction malloc patch)\n";
+
+  std::cout << "[4/7] Backing up original memory...\n";
+  auto malloc_backup = read_memory(pid, malloc_addr, 4);
+  auto cave_backup = read_memory(pid, cave, stage1.size());
+  auto timezone_backup = read_memory(pid, timezone_addr, 8);
+  if (malloc_backup.size() != 4 || cave_backup.size() != stage1.size() ||
+      timezone_backup.size() != 8) {
+    std::cerr << " Failed to backup memory\n";
+    return false;
+  }
+  std::cout << "  ✓ Backup complete\n";
+
+  auto back_to_malloc = cave_back_to_malloc(cave, malloc_addr);
+
+  // Undo for every failure path below. Order matters: malloc first (one
+  // atomic word), then release anyone parked in the cave, then the lock
+  // variable (a zero lock byte must never be visible while a thread could
+  // still take the lock).
+  auto rollback = [&]() {
+    write_memory(pid, malloc_addr, malloc_backup);
+    write_memory(pid, cave, back_to_malloc);
+    write_memory(pid, timezone_addr, timezone_backup);
+    restore_cave_later(pid, cave, back_to_malloc, cave_backup);
+  };
+
+  std::cout << "[5/7] Injecting stage 1 shellcode...\n";
+  std::vector<uint8_t> zero(8, 0);
+  if (!write_memory(pid, timezone_addr, zero)) {
+    std::cerr << " Failed to zero timezone\n";
+    return false;
+  }
+  if (!write_memory(pid, cave, stage1)) {
+    std::cerr << " Failed to write stage1 into the code cave\n";
+    write_memory(pid, timezone_addr, timezone_backup);
+    return false;
+  }
+  // Only now make it reachable: one word at malloc+0.
+  if (!write_memory(pid, malloc_addr, le32_words({arm64_b(malloc_addr, cave)}))) {
+    std::cerr << " Failed to patch malloc\n";
+    write_memory(pid, cave, cave_backup);
+    write_memory(pid, timezone_addr, timezone_backup);
+    return false;
+  }
+  std::cout << "  ✓ Stage1 injected\n";
+
+  std::cout << "[6/7] Waiting for malloc() trigger...\n";
+  uintptr_t new_map = 0;
+  int timeout_counter = 0;
+  const int MAX_TIMEOUT = 30000;
+
+  char kill_cmd[256];
+  snprintf(kill_cmd, sizeof(kill_cmd), "kill -10 %d 2>/dev/null", pid); // SIGUSR1 → GC
+  system(kill_cmd);
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  std::cout << "  → Trigger signals sent\n";
+
+  while (true) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(3));
+    auto data = read_memory(pid, timezone_addr, 8);
+    if (data.size() == 8) {
+      uint64_t val = 0;
+      memcpy(&val, data.data(), 8);
+      if ((val & 0x1) && (val & 0xFFFFFFFFFFFFFFF0)) {
+        new_map = val & 0xFFFFFFFFFFFFFFF0;
+        break;
+      }
+    }
+    if (++timeout_counter > MAX_TIMEOUT) {
+      std::cerr << " Timeout waiting for malloc trigger\n";
+      rollback();
+      return false;
+    }
+  }
+  std::cout << "  ✓ Triggered! New map: 0x" << std::hex << new_map << std::dec << "\n";
+
+  std::cout << "[7/7] Finalizing injection...\n";
+
+  // (a) malloc() is whole again - one atomic word. From here on new
+  //     callers run the real function. This has to happen BEFORE stage 2
+  //     starts: stage 2 calls dlopen(), and the library's constructors
+  //     call malloc() themselves on the very thread that holds the lock.
+  if (!write_memory(pid, malloc_addr, malloc_backup)) {
+    std::cerr << "Failed to restore malloc\n";
+    rollback();
+    return false;
+  }
+
+  // (b) Release the threads waiting for the lock in the cave: each of the
+  //     six pre-lock slots now branches to malloc+0. The lock holder is
+  //     past these slots by definition (it published the map address).
+  if (!write_memory(pid, cave, back_to_malloc)) {
+    std::cerr << "Warning: Failed to release waiters in the code cave\n";
+  }
+
+  // (c) Only after (b): the lock variable gets its real value back. No
+  //     thread can reach the lock test anymore, so a zero byte here cannot
+  //     hand the lock to a second thread.
+  if (!write_memory(pid, timezone_addr, timezone_backup)) {
+    std::cerr << "Warning: Failed to restore timezone\n";
+  }
+
+  // (d) Stage 2 into the new map. The lock holder is spinning on the first
+  //     word (`b .`), so write everything else first and that word last -
+  //     it must not start executing a half-written stage 2.
+  if (stage2.size() <= 4) {
+    std::cerr << "Invalid stage2\n";
+    return false;
+  }
+  std::vector<uint8_t> stage2_tail(stage2.begin() + 4, stage2.end());
+  std::vector<uint8_t> stage2_head(stage2.begin(), stage2.begin() + 4);
+  if (!write_memory(pid, new_map + 4, stage2_tail) ||
+      !write_memory(pid, new_map, stage2_head)) {
+    std::cerr << "Failed to write stage2\n";
+    return false;
+  }
+  std::cout << "  ✓ Stage2 written to new map\n";
+
+  // (e) The cave goes back to zeros later; until then it holds only
+  //     `B malloc` slots (plus the now unreachable rest of stage 1).
+  restore_cave_later(pid, cave, back_to_malloc, cave_backup);
+  std::cout << "  ✓ Original functions restored\n";
+
+  std::cout << "\n Injection complete! Loaded: " << so_path << "\n";
+  return true;
+}
+
 bool inject(int pid, const char *so_path) {
   std::cout << "=== RENEF Injection ===\n";
   std::cout << "Target PID: " << pid << "\n";
@@ -591,6 +887,20 @@ bool inject(int pid, const char *so_path) {
         shellcode::arm64_stage1_linjector_exact(timezone_addr, stage2.size());
     std::cout << "  ✓ Stage1: " << stage1.size() << "B, Stage2: " << stage2.size()
               << "B\n";
+
+    // Preferred path - stage 1 in a code cave, malloc()
+    // patched with a single branch. Falls back to the original in-place
+    // scheme below only when libc has no usable padding after its text.
+    uintptr_t cave = find_code_cave(pid, libc_path, libc_base, malloc_addr, stage1.size());
+    // Escape hatch: RENEF_NO_CODE_CAVE=1 in renef_server's environment
+    // forces the original in-place scheme (also used to measure it).
+    if (getenv("RENEF_NO_CODE_CAVE")) {
+      cave = 0;
+    }
+    if (cave) {
+      return inject_via_code_cave(pid, malloc_addr, timezone_addr, cave, stage1, stage2, so_path);
+    }
+    std::cout << "  ⚠ No code cave after libc text, using in-place malloc patch\n";
 
     std::cout << "[4/7] Backing up original memory...\n";
     auto malloc_backup = read_memory(pid, malloc_addr, stage1.size());

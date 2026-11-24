@@ -35,6 +35,7 @@
 #include <agent/strace.h>
 #include <agent/proc.h>
 #include <agent/handlers.h>
+#include <agent/output_queue.h>
 #include <sys/system_properties.h>
 
 static JavaVM* g_jvm = NULL;
@@ -414,10 +415,9 @@ static void capture_free(void) {
     g_capture_used = 0;
 }
 
-static void route_command(int client_fd, const char* cmd, size_t cmd_len) {
+static void route_command_in(int client_fd, const char* cmd, size_t cmd_len, char* main_cmd, size_t main_cap) {
     LOGI("Command: %s", cmd);
 
-    static char main_cmd[65536];
     char filter[256] = {0};
 
     const char* is_exec_cmd = strstr(cmd, " exec ");
@@ -429,7 +429,7 @@ static void route_command(int client_fd, const char* cmd, size_t cmd_len) {
 
     if (tilde) {
         size_t len = tilde - cmd;
-        if (len >= sizeof(main_cmd)) len = sizeof(main_cmd) - 1;
+        if (len >= main_cap) len = main_cap - 1;
         strncpy(main_cmd, cmd, len);
         main_cmd[len] = '\0';
 
@@ -437,8 +437,8 @@ static void route_command(int client_fd, const char* cmd, size_t cmd_len) {
         filter[sizeof(filter) - 1] = '\0';
         LOGI("Filter enabled: '%s'", filter);
     } else {
-        strncpy(main_cmd, cmd, sizeof(main_cmd) - 1);
-        main_cmd[sizeof(main_cmd) - 1] = '\0';
+        strncpy(main_cmd, cmd, main_cap - 1);
+        main_cmd[main_cap - 1] = '\0';
     }
 
     int use_capture = (filter[0] != '\0');
@@ -467,7 +467,7 @@ static void route_command(int client_fd, const char* cmd, size_t cmd_len) {
 
     if (filter[0] != '\0') {
         size_t cmd_len_now = strlen(main_cmd);
-        snprintf(main_cmd + cmd_len_now, sizeof(main_cmd) - cmd_len_now, "~%s", filter);
+        snprintf(main_cmd + cmd_len_now, main_cap - cmd_len_now, "~%s", filter);
     }
 
     if (!cmd_dispatch(client_fd, main_cmd)) {
@@ -481,7 +481,69 @@ static void route_command(int client_fd, const char* cmd, size_t cmd_len) {
     }
 }
 
+// The working copy of the command used to be a fixed `static char
+// main_cmd[65536]`: anything longer was silently TRUNCATED by strncpy.
+// Found live while verifying request framing with a 513KB script: delivered intact
+// over both hops, then cut at 64KB here - and because the cut happened to
+// land inside a comment the fragment still compiled, ran, and reported
+// "OK" without executing the rest. (For `l <file>` the payload is
+// hex-encoded, so the effective limit was 32KB of script.) Size it from
+// the actual command instead.
+static void route_command(int client_fd, const char* cmd, size_t cmd_len) {
+    size_t main_cap = cmd_len + 512; // room for the re-appended "~filter"
+    char* main_cmd = (char*)malloc(main_cap);
+    if (!main_cmd) {
+        const char* error = "ERROR: out of memory for command buffer\n";
+        write(client_fd, error, strlen(error));
+        return;
+    }
+    route_command_in(client_fd, cmd, cmd_len, main_cmd, main_cap);
+    free(main_cmd);
+}
+
+// --- Request framing ---
+// A peer that wants an unambiguous end-of-response sends
+//     "@req <id> <len>\n" + <len> bytes of command
+// and gets, after everything that command wrote,
+//     "\x1e@done <id>\n"
+// Commands sent without the header behave exactly as before (no marker),
+// so older peers keep working.
+#define AGENT_REQ_PREFIX "@req "
+#define AGENT_EVENTS_HELLO "@events"
+#define AGENT_REQ_PREFIX_LEN 5
+// The server accepts host commands up to 8MB and `l <file>` hex-encodes
+// the script (2x), so a request can be up to ~16MB here.
+#define AGENT_MAX_REQUEST_BYTES (17UL * 1024 * 1024)
+
+// Returns the '\n' that separates a legacy command from a framed request
+// header ("\n@req ") inside buf, or NULL.
+static char* agent_find_frame_boundary(char* buf, size_t len) {
+    if (len < AGENT_REQ_PREFIX_LEN + 1) return NULL;
+    for (size_t i = 0; i + AGENT_REQ_PREFIX_LEN < len; i++) {
+        if (buf[i] == '\n' && memcmp(buf + i + 1, AGENT_REQ_PREFIX, AGENT_REQ_PREFIX_LEN) == 0) {
+            return buf + i;
+        }
+    }
+    return NULL;
+}
+
+static void agent_send_done(int client_fd, unsigned long req_id) {
+    // print()/console.log only ENQUEUE (output_queue); wait for everything
+    // this command queued to actually reach the socket before the marker,
+    // otherwise the marker overtakes the command's own last lines and they
+    // show up as the beginning of the next command's response.
+    output_queue_flush(2000);
+
+    char done[48];
+    int n = snprintf(done, sizeof(done), "\x1e@done %lu\n", req_id);
+    if (n > 0) {
+        write(client_fd, done, (size_t)n);
+    }
+}
+
 static void* command_handler(void* arg) {
+    hook_mark_agent_thread(); // Agent threads are never hooked (native.c)
+    output_queue_set_command_thread(); // this thread's output is "the reply"
     LOGI("Starting command handler...");
 
     int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -520,58 +582,132 @@ static void* command_handler(void* arg) {
         LOGI("Client connected (fd=%d)", client_fd);
         g_output_client_fd = client_fd;
 
-        while (1) {
-            size_t buf_size = 65536;
-            size_t buf_used = 0;
-            char* cmd = (char*)malloc(buf_size);
-            if (!cmd) {
-                LOGE("malloc failed");
-                break;
-            }
+        // Bytes received on this connection that have not been consumed as
+        // a command yet. Persistent across commands so that a second
+        // request arriving in the same read() as the first (pipelining, or
+        // simply a client that did not wait) is kept for the next
+        // iteration instead of being glued onto the first one.
+        size_t in_cap = 65536;
+        size_t in_used = 0;
+        char* inbuf = (char*)malloc(in_cap);
+        if (!inbuf) {
+            LOGE("malloc failed");
+            close(client_fd);
+            continue;
+        }
 
-            int complete = 0;
-            while (!complete) {
-                if (buf_used >= buf_size - 1) {
-                    buf_size *= 2;
-                    if (buf_size > 2 * 1024 * 1024) {
-                        LOGE("Command too large");
+        int parked_as_event_channel = 0;
+
+        while (1) {
+            char* cmd = NULL;
+            size_t buf_used = 0;
+            unsigned long req_id = 0;   // 0 = legacy (unframed) command
+            int disconnected = 0;
+
+            while (!cmd) {
+                // --- Framed request ---
+                //   "@req <id> <len>\n" followed by exactly <len> bytes.
+                // Exact length instead of "the chunk ended with a newline
+                // and 50ms passed", so multi-line payloads and back-to-back
+                // requests are delimited correctly, and the id lets the
+                // peer tell which request a completion marker belongs to.
+                if (in_used >= AGENT_REQ_PREFIX_LEN &&
+                    memcmp(inbuf, AGENT_REQ_PREFIX, AGENT_REQ_PREFIX_LEN) == 0) {
+                    char* nl = (char*)memchr(inbuf, '\n', in_used < 64 ? in_used : 64);
+                    if (nl) {
+                        unsigned long id = 0, len = 0;
+                        if (sscanf(inbuf + AGENT_REQ_PREFIX_LEN, "%lu %lu", &id, &len) != 2 ||
+                            id == 0 || len > AGENT_MAX_REQUEST_BYTES) {
+                            LOGE("Malformed request frame header, dropping connection");
+                            disconnected = 1;
+                            break;
+                        }
+                        size_t hdr = (size_t)(nl - inbuf) + 1;
+                        if (in_used >= hdr + len) {
+                            cmd = (char*)malloc(len + 1);
+                            if (!cmd) { LOGE("malloc failed"); disconnected = 1; break; }
+                            memcpy(cmd, inbuf + hdr, len);
+                            cmd[len] = '\0';
+                            buf_used = len;
+                            req_id = id;
+                            memmove(inbuf, inbuf + hdr + len, in_used - hdr - len);
+                            in_used -= hdr + len;
+                            break;
+                        }
+                    } else if (in_used >= 64) {
+                        LOGE("Request frame header too long, dropping connection");
+                        disconnected = 1;
                         break;
                     }
-                    char* new_buf = (char*)realloc(cmd, buf_size);
-                    if (!new_buf) {
-                        LOGE("realloc failed");
+                } else if (in_used > 0 && agent_find_frame_boundary(inbuf, in_used) != NULL) {
+                    // --- Legacy command immediately followed by a framed
+                    // request in the same buffer (e.g. the unframed "con
+                    // <key>" handshake and the first framed exec arriving
+                    // within the same 50ms). The frame header starts at a
+                    // line boundary, so the legacy command ends right
+                    // there - without this the mixed buffer matched
+                    // neither rule and the loop waited forever.
+                    char* nl = agent_find_frame_boundary(inbuf, in_used);
+                    size_t len = (size_t)(nl - inbuf);
+                    cmd = (char*)malloc(len + 1);
+                    if (!cmd) { LOGE("malloc failed"); disconnected = 1; break; }
+                    memcpy(cmd, inbuf, len);
+                    cmd[len] = '\0';
+                    buf_used = len;
+                    memmove(inbuf, nl + 1, in_used - len - 1);
+                    in_used -= len + 1;
+                    break;
+                } else if (in_used > 0 && inbuf[in_used - 1] == '\n') {
+                    // --- Legacy (unframed) command: unchanged heuristic ---
+                    // Check if more data follows (embedded newline in multi-line payload)
+                    struct pollfd pfd = {client_fd, POLLIN, 0};
+                    if (poll(&pfd, 1, 50) <= 0) {
+                        cmd = (char*)malloc(in_used + 1);
+                        if (!cmd) { LOGE("malloc failed"); disconnected = 1; break; }
+                        memcpy(cmd, inbuf, in_used);
+                        cmd[in_used] = '\0';
+                        buf_used = in_used;
+                        in_used = 0;
                         break;
                     }
-                    cmd = new_buf;
+                    // else: more data available, keep reading
                 }
 
-                ssize_t n = read(client_fd, cmd + buf_used, buf_size - buf_used - 1);
+                if (in_used >= in_cap - 1) {
+                    if (in_cap > 2 * AGENT_MAX_REQUEST_BYTES) {
+                        LOGE("Command too large");
+                        disconnected = 1;
+                        break;
+                    }
+                    char* new_buf = (char*)realloc(inbuf, in_cap * 2);
+                    if (!new_buf) {
+                        LOGE("realloc failed");
+                        disconnected = 1;
+                        break;
+                    }
+                    inbuf = new_buf;
+                    in_cap *= 2;
+                }
+
+                ssize_t n = read(client_fd, inbuf + in_used, in_cap - in_used - 1);
 
                 if (n <= 0) {
-                    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
                         usleep(10000);
                         continue;
                     }
                     LOGI("Client disconnected");
-                    free(cmd);
-                    cmd = NULL;
+                    disconnected = 1;
                     break;
                 }
 
-                buf_used += n;
-                cmd[buf_used] = '\0';
-
-                if (buf_used > 0 && cmd[buf_used - 1] == '\n') {
-                    // Check if more data follows (embedded newline in multi-line payload)
-                    struct pollfd pfd = {client_fd, POLLIN, 0};
-                    if (poll(&pfd, 1, 50) <= 0) {
-                        complete = 1;
-                    }
-                    // else: more data available, keep reading
-                }
+                in_used += n;
             }
 
-            if (!cmd) break;
+            if (disconnected || !cmd) {
+                free(cmd);
+                break;
+            }
 
             while (buf_used > 0 && (cmd[buf_used-1] == '\n' || cmd[buf_used-1] == '\r' || cmd[buf_used-1] == ' ')) {
                 cmd[--buf_used] = '\0';
@@ -579,10 +715,28 @@ static void* command_handler(void* arg) {
 
             if (buf_used == 0) {
                 free(cmd);
+                if (req_id) agent_send_done(client_fd, req_id);
                 continue;
             }
 
-            LOGI("Received command (%zu bytes)", buf_used);
+            LOGI("Received command (%zu bytes, req=%lu)", buf_used, req_id);
+
+            // Event channel: a connection whose first line is "@events" is
+            // not a command connection. It is kept open as the place where
+            // hook callbacks and the syscall tracer write their output, so
+            // that output no longer travels inside command replies (see
+            // output_queue.h). The server opens it right before the command
+            // connection; this loop then goes back to accept() for that one.
+            if (!is_agent_established && req_id == 0 && strcmp(cmd, AGENT_EVENTS_HELLO) == 0) {
+                free(cmd);
+                static const char ack[] = AGENT_EVENTS_HELLO " ok\n";
+                if (write(client_fd, ack, sizeof(ack) - 1) == (ssize_t)(sizeof(ack) - 1)) {
+                    output_queue_set_event_fd(client_fd);
+                    parked_as_event_channel = 1;
+                    LOGI("Event channel connected (fd=%d)", client_fd);
+                }
+                break;
+            }
 
             g_current_jni_env = get_jni_env();
             if (g_current_jni_env) {
@@ -598,6 +752,8 @@ static void* command_handler(void* arg) {
             route_command(client_fd, cmd, buf_used);
             free(cmd);
 
+            if (req_id) agent_send_done(client_fd, req_id);
+
             // Detach from JVM before blocking on read() to prevent
             // ART thread suspension timeouts on Android 9.
             // When attached, ART tries to suspend this thread for GC,
@@ -608,6 +764,15 @@ static void* command_handler(void* arg) {
             }
         }
 
+        free(inbuf);
+
+        if (parked_as_event_channel) {
+            // Not a session: nothing to clean up, and the descriptor now
+            // belongs to the output queue.
+            g_output_client_fd = -1;
+            continue;
+        }
+
         {
             int native_count = uninstall_all_hooks();
             if (native_count > 0)
@@ -616,12 +781,24 @@ static void* command_handler(void* arg) {
             int java_count = uninstall_all_java_hooks();
             if (java_count > 0)
                 LOGI("Cleaned up %d Java hook(s)", java_count);
+            // Removing Java hooks attaches this thread to the runtime; it
+            // goes back to a blocking accept() next, so detach again (see
+            // the note in the command loop above).
+            if (g_jvm) {
+                JNIEnv* attached = NULL;
+                if ((*g_jvm)->GetEnv(g_jvm, (void**)&attached, JNI_VERSION_1_6) == JNI_OK) {
+                    (*g_jvm)->DetachCurrentThread(g_jvm);
+                }
+                g_current_jni_env = NULL;
+            }
 
             strace_remove_all();
         }
 
         g_output_client_fd = -1;
         close(client_fd);
+        // The event channel belongs to the session that just ended.
+        output_queue_set_event_fd(-1);
         is_agent_established = false;
         memset(session_key, 0, sizeof(session_key));
         LOGI("Connection closed, all hooks restored, session reset");
@@ -679,6 +856,13 @@ void init(void) {
 
     register_builtin_commands();
     LOGI("Builtin commands registered");
+
+    /* Starts the dedicated output-queue writer thread. Must happen
+     * before any hook callback can run (so before scripts are loaded):
+     * send_to_cli() in the lua/api_*.c files only enqueues now, and
+     * this writer thread is what actually performs the (possibly
+     * blocking) socket write, outside of g_lua_mutex. */
+    output_queue_init();
 
     g_lua_engine = lua_engine_create();
     if (g_lua_engine) {

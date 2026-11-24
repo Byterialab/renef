@@ -1,24 +1,36 @@
+#include <agent/globals.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <dirent.h>
 #include <android/log.h>
 #include <lauxlib.h>
 #include <agent/lua_memory.h>
+#include <agent/output_queue.h>
 
 #define TAG "LUA_MEMORY"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 
 extern int g_output_client_fd;
 
+/* Enqueues onto the bounded output_queue instead of calling write()
+ * directly -- see agent/output_queue.h. This keeps the (possibly
+ * blocking) socket write off of the hook-callback path, which runs
+ * with g_lua_mutex held. */
 static void send_to_cli(const char* msg) {
     LOGI("[CLI_SEND] g_output_client_fd=%d, msg=%s", g_output_client_fd, msg ? msg : "NULL");
     if (g_output_client_fd >= 0 && msg) {
         size_t len = strlen(msg);
-        ssize_t written = write(g_output_client_fd, msg, len);
-        write(g_output_client_fd, "\n", 1);
-        LOGI("[CLI_SEND] wrote %zd bytes to fd %d", written, g_output_client_fd);
+        char* buf = (char*)malloc(len + 1);
+        if (buf) {
+            memcpy(buf, msg, len);
+            buf[len] = '\n';
+            output_queue_push(buf, len + 1);
+            free(buf);
+        }
     } else {
         LOGI("[CLI_SEND] SKIPPED - fd=%d", g_output_client_fd);
     }
@@ -51,6 +63,69 @@ static void* my_memmem(const void* haystack, size_t haystack_len,
     return NULL;
 }
 
+/* One parsed /proc/self/maps row: address range, raw perms ("r-xp"), path
+ * (empty for anonymous mappings). Shared by the Memory.search family below
+ * and by Process.enumerateRanges, so the maps-line format is parsed in
+ * exactly one place. */
+typedef struct {
+    uintptr_t start;
+    uintptr_t end;
+    char perms[8];
+    char path[256];
+} MapsLine;
+
+static bool parse_maps_line(const char* line, MapsLine* out) {
+    char addr[64], offset[16], dev[16], inode[16];
+    out->perms[0] = '\0';
+    out->path[0] = '\0';
+
+    int parsed = sscanf(line, "%63s %7s %15s %15s %15s %255[^\n]",
+                         addr, out->perms, offset, dev, inode, out->path);
+    if (parsed < 5) {
+        return false;
+    }
+
+    char* dash = strchr(addr, '-');
+    if (dash == NULL) {
+        return false;
+    }
+    *dash = '\0';
+
+    out->start = (uintptr_t)strtoull(addr, NULL, 16);
+    out->end = (uintptr_t)strtoull(dash + 1, NULL, 16);
+    if (out->end <= out->start) {
+        return false;
+    }
+
+    return true;
+}
+
+/*
+ * Not everything /proc/self/maps lists as readable can be read. GPU drivers
+ * map device and doorbell pages into the process as SHARED mappings (seen on
+ * a Mali device as "rw-s ... /mali csf db (deleted)", next to the /dev/mali0
+ * ones), and touching those raises SIGBUS - the scan used to kill the target
+ * there. The kernel refuses to copy from such pages through /proc/self/mem
+ * (an error, not a signal), so one byte per page read that way tells the
+ * safe shared mappings (memfd, ashmem, JIT caches) from the dangerous ones.
+ * Private mappings are scanned as before, without the probe.
+ */
+static bool region_scannable(int mem_fd, const MapsLine* ml) {
+    if (ml->perms[3] != 's') {
+        return true;
+    }
+    if (mem_fd < 0) {
+        return false;   /* cannot check: leave shared memory alone */
+    }
+    unsigned char b;
+    for (uintptr_t a = ml->start; a < ml->end; a += 4096) {
+        if (pread(mem_fd, &b, 1, (off_t)a) != 1) {
+            return false;
+        }
+    }
+    return true;
+}
+
 MemorySearchResult memory_search(const unsigned char* pattern, size_t patternLen) {
     MemorySearchResult result;
     memset(&result, 0, sizeof(result));
@@ -69,39 +144,28 @@ MemorySearchResult memory_search(const unsigned char* pattern, size_t patternLen
     }
 
     char buffer[512];
+    int mem_fd = agent_open_self_mem(O_RDONLY);
 
     while (fgets(buffer, sizeof(buffer), maps) && result.count < DEFAULT_MAX_RESULTS) {
-        char addr[64], perms[8], offset[16], dev[16], inode[16], path[256];
-        path[0] = '\0';
-
-        int parsed = sscanf(buffer, "%63s %7s %15s %15s %15s %255[^\n]",
-                           addr, perms, offset, dev, inode, path);
-        if (parsed < 5) {
+        MapsLine ml;
+        if (!parse_maps_line(buffer, &ml)) {
             continue;
         }
 
-        if (perms[0] != 'r') {
+        if (ml.perms[0] != 'r') {
             continue;
         }
 
-        if (strstr(path, "/dev/") || strstr(buffer, "[vdso]") || strstr(buffer, "[vvar]")) {
+        if (strstr(ml.path, "/dev/") || strstr(buffer, "[vdso]") || strstr(buffer, "[vvar]")) {
+            continue;
+        }
+        if (!region_scannable(mem_fd, &ml)) {
             continue;
         }
 
-        char* dash = strchr(addr, '-');
-        if (dash == NULL) {
-            continue;
-        }
-
-        *dash = '\0';
-        char* start_str = addr;
-        char* end_str = dash + 1;
-
-        uintptr_t startAddr = strtoull(start_str, NULL, 16);
-        uintptr_t endAddr = strtoull(end_str, NULL, 16);
-        if (endAddr <= startAddr) {
-            continue;
-        }
+        uintptr_t startAddr = ml.start;
+        uintptr_t endAddr = ml.end;
+        const char* path = ml.path;
 
         size_t regionSize = endAddr - startAddr;
         if (regionSize < patternLen) {
@@ -178,6 +242,7 @@ MemorySearchResult memory_search(const unsigned char* pattern, size_t patternLen
         }
     }
 
+    if (mem_fd >= 0) close(mem_fd);
     fclose(maps);
     return result;
 }
@@ -272,6 +337,7 @@ MemorySearchResult memory_search_pattern(const int* pattern, size_t patternLen) 
     char buffer[512];
     size_t totalBytesSearched = 0;
     const size_t MAX_SEARCH_BYTES = 512 * 1024 * 1024;  // 512MB limit
+    int mem_fd = agent_open_self_mem(O_RDONLY);
 
     while (fgets(buffer, sizeof(buffer), maps) && result.count < DEFAULT_MAX_RESULTS) {
         if (totalBytesSearched > MAX_SEARCH_BYTES) {
@@ -279,22 +345,16 @@ MemorySearchResult memory_search_pattern(const int* pattern, size_t patternLen) 
             break;
         }
 
-        char addr[64], perms[8], offset[16], dev[16], inode[16], path[256];
-        path[0] = '\0';
+        MapsLine ml;
+        if (!parse_maps_line(buffer, &ml)) continue;
+        if (ml.perms[0] != 'r') continue;
 
-        if (sscanf(buffer, "%63s %7s %15s %15s %15s %255[^\n]", addr, perms, offset, dev, inode, path) < 5)
-            continue;
-        if (perms[0] != 'r') continue;
+        if (strstr(ml.path, "/dev/") || strstr(buffer, "[vdso]") || strstr(buffer, "[vvar]")) continue;
+        if (!region_scannable(mem_fd, &ml)) continue;
 
-        if (strstr(path, "/dev/") || strstr(buffer, "[vdso]") || strstr(buffer, "[vvar]")) continue;
-
-        char* dash = strchr(addr, '-');
-        if (!dash) continue;
-        *dash = '\0';
-
-        uintptr_t startAddr = strtoull(addr, NULL, 16);
-        uintptr_t endAddr = strtoull(dash + 1, NULL, 16);
-        if (endAddr <= startAddr) continue;
+        uintptr_t startAddr = ml.start;
+        uintptr_t endAddr = ml.end;
+        const char* path = ml.path;
 
         size_t regionSize = endAddr - startAddr;
         if (regionSize < patternLen) continue;
@@ -330,6 +390,7 @@ MemorySearchResult memory_search_pattern(const int* pattern, size_t patternLen) 
     }
 
     LOGI("Pattern search done: %d results, searched %zu bytes", result.count, totalBytesSearched);
+    if (mem_fd >= 0) close(mem_fd);
     fclose(maps);
     return result;
 }
@@ -356,20 +417,13 @@ MemorySearchResult memory_search_in_lib(const char* libName, const unsigned char
     while (fgets(buffer, sizeof(buffer), maps) && result.count < DEFAULT_MAX_RESULTS) {
         if (!strstr(buffer, libName)) continue;
 
-        char addr[64], perms[8], offset[16], dev[16], inode[16], path[256];
-        path[0] = '\0';
+        MapsLine ml;
+        if (!parse_maps_line(buffer, &ml)) continue;
+        if (ml.perms[0] != 'r') continue;
 
-        if (sscanf(buffer, "%63s %7s %15s %15s %15s %255[^\n]", addr, perms, offset, dev, inode, path) < 5)
-            continue;
-        if (perms[0] != 'r') continue;
-
-        char* dash = strchr(addr, '-');
-        if (!dash) continue;
-        *dash = '\0';
-
-        uintptr_t startAddr = strtoull(addr, NULL, 16);
-        uintptr_t endAddr = strtoull(dash + 1, NULL, 16);
-        if (endAddr <= startAddr) continue;
+        uintptr_t startAddr = ml.start;
+        uintptr_t endAddr = ml.end;
+        const char* path = ml.path;
 
         size_t regionSize = endAddr - startAddr;
         if (regionSize < patternLen) continue;
@@ -409,20 +463,13 @@ MemorySearchResult memory_search_pattern_in_lib(const char* libName, const int* 
     while (fgets(buffer, sizeof(buffer), maps) && result.count < DEFAULT_MAX_RESULTS) {
         if (!strstr(buffer, libName)) continue;
 
-        char addr[64], perms[8], offset[16], dev[16], inode[16], path[256];
-        path[0] = '\0';
+        MapsLine ml;
+        if (!parse_maps_line(buffer, &ml)) continue;
+        if (ml.perms[0] != 'r') continue;
 
-        if (sscanf(buffer, "%63s %7s %15s %15s %15s %255[^\n]", addr, perms, offset, dev, inode, path) < 5)
-            continue;
-        if (perms[0] != 'r') continue;
-
-        char* dash = strchr(addr, '-');
-        if (!dash) continue;
-        *dash = '\0';
-
-        uintptr_t startAddr = strtoull(addr, NULL, 16);
-        uintptr_t endAddr = strtoull(dash + 1, NULL, 16);
-        if (endAddr <= startAddr) continue;
+        uintptr_t startAddr = ml.start;
+        uintptr_t endAddr = ml.end;
+        const char* path = ml.path;
 
         size_t regionSize = endAddr - startAddr;
         if (regionSize < patternLen) continue;
@@ -624,6 +671,18 @@ static int lua_mem_write_u64(lua_State* L) {
 static int lua_mem_read_str(lua_State* L) {
     uintptr_t addr = (uintptr_t)luaL_checkinteger(L, 1);
     size_t maxLen = luaL_optinteger(L, 2, 256);
+
+    // A hooked function's REAL argument can legitimately
+    // be NULL (e.g. a real strcmp()/access() call with a null pointer
+    // somewhere in a busy system's normal operation) - a script calling
+    // Memory.readString(args[N]) on it unconditionally (the common
+    // pattern, see taint_filter.lua) used to crash the whole process via
+    // strnlen(NULL, ...). Return nil instead - "no string here" - same
+    // as any other Memory.read* on an invalid/absent address.
+    if (addr == 0) {
+        lua_pushnil(L);
+        return 1;
+    }
 
     const char* str = (const char*)addr;
     size_t len = strnlen(str, maxLen);
@@ -1078,4 +1137,117 @@ void register_memory_search_api(lua_State* L) {
     /* global hexdump() - Frida-compatible, callable from anywhere */
     lua_pushcfunction(L, lua_hexdump);
     lua_setglobal(L, "hexdump");
+}
+
+/*
+ * Process.enumerateRanges()
+ *
+ * List every mapped region of the current process by walking
+ * /proc/self/maps (same line format parsed by Memory.search, via the shared
+ * parse_maps_line() helper above). Unlike Memory.search's internal scan this
+ * is not filtered to readable/non-device regions -- it reports everything,
+ * including anonymous and device-backed mappings, so scripts get a complete
+ * picture of the address space.
+ *
+ *   for _, r in ipairs(Process.enumerateRanges()) do
+ *       print(string.format("0x%x-0x%x %s %s", r.start, r["end"], r.perms, r.path))
+ *   end
+ *
+ * Each entry: { start, end, size, perms, path }. perms is the raw maps
+ * string (e.g. "r-xp"); path is "" for anonymous mappings.
+ * Returns: array table, or nil if /proc/self/maps could not be opened.
+ */
+static int lua_process_enumerate_ranges(lua_State* L) {
+    FILE* maps = fopen("/proc/self/maps", "r");
+    if (!maps) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    lua_newtable(L);
+    int idx = 1;
+    char buffer[512];
+
+    while (fgets(buffer, sizeof(buffer), maps)) {
+        MapsLine ml;
+        if (!parse_maps_line(buffer, &ml)) {
+            continue;
+        }
+
+        lua_newtable(L);
+
+        lua_pushinteger(L, (lua_Integer)ml.start);
+        lua_setfield(L, -2, "start");
+
+        lua_pushinteger(L, (lua_Integer)ml.end);
+        lua_setfield(L, -2, "end");
+
+        lua_pushinteger(L, (lua_Integer)(ml.end - ml.start));
+        lua_setfield(L, -2, "size");
+
+        lua_pushstring(L, ml.perms);
+        lua_setfield(L, -2, "perms");
+
+        lua_pushstring(L, ml.path);
+        lua_setfield(L, -2, "path");
+
+        lua_rawseti(L, -2, idx++);
+    }
+
+    fclose(maps);
+    return 1;
+}
+
+/*
+ * Process.enumerateThreads()
+ *
+ * List the thread IDs of the current process by reading the /proc/self/task
+ * directory (one entry per live thread, named by its tid). Mirrors
+ * Thread.id(), which returns the calling thread's own tid as a plain
+ * integer -- this returns all of them as an array.
+ *
+ *   local tids = Process.enumerateThreads()
+ *   print(#tids .. " threads")
+ *
+ * Returns: array of integers (tids), or nil if /proc/self/task could not be
+ * opened.
+ */
+static int lua_process_enumerate_threads(lua_State* L) {
+    DIR* dir = opendir("/proc/self/task");
+    if (!dir) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    lua_newtable(L);
+    int idx = 1;
+    struct dirent* entry;
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;  // skip "." / ".."
+
+        char* endptr = NULL;
+        long tid = strtol(entry->d_name, &endptr, 10);
+        if (endptr == entry->d_name || *endptr != '\0') {
+            continue;  // not a numeric task entry
+        }
+
+        lua_pushinteger(L, (lua_Integer)tid);
+        lua_rawseti(L, -2, idx++);
+    }
+
+    closedir(dir);
+    return 1;
+}
+
+void register_process_api(lua_State* L) {
+    lua_newtable(L);
+
+    lua_pushcfunction(L, lua_process_enumerate_ranges);
+    lua_setfield(L, -2, "enumerateRanges");
+
+    lua_pushcfunction(L, lua_process_enumerate_threads);
+    lua_setfield(L, -2, "enumerateThreads");
+
+    lua_setglobal(L, "Process");
 }

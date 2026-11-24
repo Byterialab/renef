@@ -135,13 +135,23 @@ public:
         bool running = true;
 
         while (running) {
-            struct pollfd pfds[2];
+            // With an event channel the trace lines arrive there; the
+            // command socket only carries the reply of the exec above.
+            int ev = socket_helper.get_event_fd();
+            struct pollfd pfds[3];
             pfds[0] = {sock, POLLIN, 0};
             pfds[1] = {client_fd, POLLIN, 0};
+            pfds[2] = {ev, POLLIN, 0};
 
-            int ret = poll(pfds, 2, 1000);
+            int ret = poll(pfds, ev >= 0 ? 3 : 2, 1000);
 
             if (ret > 0) {
+                if (ev >= 0 && (pfds[2].revents & (POLLIN | POLLHUP | POLLERR))) {
+                    socket_helper.pump_events();
+                    std::string lines = socket_helper.take_events();
+                    if (!lines.empty()) write(client_fd, lines.c_str(), lines.size());
+                }
+
                 if (pfds[0].revents & POLLIN) {
                     ssize_t n = recv(sock, buffer, sizeof(buffer) - 1, 0);
                     if (n > 0) {

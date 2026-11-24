@@ -1,5 +1,6 @@
 #include <renef/cmd.h>
 #include <renef/socket_helper.h>
+#include <renef/agent_request.h>
 #include <unistd.h>
 #include <cstring>
 #include <iostream>
@@ -34,22 +35,20 @@ public:
             return CommandResult(false, "Socket connection failed");
         }
 
-        const char* cmd = "hooks\n";
-        socket_helper.send_data(cmd, strlen(cmd));
-
-        char buffer[1024];
-        struct pollfd pfd = {sock, POLLIN, 0};
-        int ret = poll(&pfd, 1, 2000);
-
-        if (ret > 0 && (pfd.revents & POLLIN)) {
-            ssize_t n = ::recv(sock, buffer, sizeof(buffer) - 1, 0);
-            if (n > 0) {
-                buffer[n] = '\0';
-                write(client_fd, buffer, n);
-            }
-        } else {
+        // Framed request: the reply is complete at the agent's completion
+        // marker. The old code did one recv() into a small fixed buffer
+        // after a 2s poll, so a long hook list was cut off and anything
+        // still on the socket was taken for the reply.
+        (void)sock;
+        std::string reply;
+        renef_agent_request::Outcome outcome = renef_agent_request::run(
+            socket_helper, pid, std::string("hooks"), 5000,
+            [&](const std::string& data) { reply += data; }, /*may_resume=*/false);
+        if (!outcome.sent || !outcome.done) {
             const char* error = "ERROR: No response from agent\n";
             write(client_fd, error, strlen(error));
+        } else if (!reply.empty()) {
+            write(client_fd, reply.data(), reply.size());
         }
 
         return CommandResult(true, "Hooks listed");
@@ -88,21 +87,22 @@ public:
         if (cmd.empty() || cmd.back() != '\n') {
             cmd += "\n";
         }
-        socket_helper.send_data(cmd.c_str(), cmd.size());
-
-        char buffer[256];
-        struct pollfd pfd = {sock, POLLIN, 0};
-        int ret = poll(&pfd, 1, 2000);
-
-        if (ret > 0 && (pfd.revents & POLLIN)) {
-            ssize_t n = ::recv(sock, buffer, sizeof(buffer) - 1, 0);
-            if (n > 0) {
-                buffer[n] = '\0';
-                write(client_fd, buffer, n);
-            }
-        } else {
+        std::string agent_cmd = cmd;
+        while (!agent_cmd.empty() && (agent_cmd.back() == '\n' || agent_cmd.back() == '\r')) agent_cmd.pop_back();
+        // Framed request: the reply is complete at the agent's completion
+        // marker. The old code did one recv() into a small fixed buffer
+        // after a 2s poll, so a long hook list was cut off and anything
+        // still on the socket was taken for the reply.
+        (void)sock;
+        std::string reply;
+        renef_agent_request::Outcome outcome = renef_agent_request::run(
+            socket_helper, pid, agent_cmd, 5000,
+            [&](const std::string& data) { reply += data; }, /*may_resume=*/false);
+        if (!outcome.sent || !outcome.done) {
             const char* error = "ERROR: No response from agent\n";
             write(client_fd, error, strlen(error));
+        } else if (!reply.empty()) {
+            write(client_fd, reply.data(), reply.size());
         }
 
         return CommandResult(true, "Unhook completed");
@@ -141,21 +141,22 @@ public:
         if (cmd.empty() || cmd.back() != '\n') {
             cmd += "\n";
         }
-        socket_helper.send_data(cmd.c_str(), cmd.size());
-
-        char buffer[256];
-        struct pollfd pfd = {sock, POLLIN, 0};
-        int ret = poll(&pfd, 1, 2000);
-
-        if (ret > 0 && (pfd.revents & POLLIN)) {
-            ssize_t n = ::recv(sock, buffer, sizeof(buffer) - 1, 0);
-            if (n > 0) {
-                buffer[n] = '\0';
-                write(client_fd, buffer, n);
-            }
-        } else {
+        std::string agent_cmd = cmd;
+        while (!agent_cmd.empty() && (agent_cmd.back() == '\n' || agent_cmd.back() == '\r')) agent_cmd.pop_back();
+        // Framed request: the reply is complete at the agent's completion
+        // marker. The old code did one recv() into a small fixed buffer
+        // after a 2s poll, so a long hook list was cut off and anything
+        // still on the socket was taken for the reply.
+        (void)sock;
+        std::string reply;
+        renef_agent_request::Outcome outcome = renef_agent_request::run(
+            socket_helper, pid, agent_cmd, 5000,
+            [&](const std::string& data) { reply += data; }, /*may_resume=*/false);
+        if (!outcome.sent || !outcome.done) {
             const char* error = "ERROR: No response from agent\n";
             write(client_fd, error, strlen(error));
+        } else if (!reply.empty()) {
+            write(client_fd, reply.data(), reply.size());
         }
 
         return CommandResult(true, "Verbose mode toggled");

@@ -298,7 +298,7 @@ void dump_elf_sections(int client_fd, const char* file_path) {
         return;
     }
 
-    char header[256];
+    char header[1024];   // the path alone can be well over 100 characters
     snprintf(header, sizeof(header),
         "Sections in %s (%zu total):\n"
         "%-20s %-16s %-16s %-10s\n"
@@ -518,7 +518,7 @@ elf_exports_t* get_exports(const char* lib_name) {
         unsigned char type = ELF64_ST_TYPE(symtab[i].st_info);
         unsigned char bind = ELF64_ST_BIND(symtab[i].st_info);
 
-        if ((type == STT_FUNC || type == STT_OBJECT || type == STT_NOTYPE || type == STT_GNU_IFUNC) && 
+        if ((type == STT_FUNC || type == STT_OBJECT || type == STT_NOTYPE || type == STT_GNU_IFUNC) &&
             symtab[i].st_value != 0 &&
             symtab[i].st_shndx != SHN_UNDEF &&
             (bind == STB_GLOBAL || bind == STB_WEAK)) {
@@ -528,7 +528,36 @@ elf_exports_t* get_exports(const char* lib_name) {
 
             strncpy(exp->name, name, sizeof(exp->name) - 1);
             exp->name[sizeof(exp->name) - 1] = '\0';
-            exp->offset = symtab[i].st_value;
+
+            if (type == STT_GNU_IFUNC) {
+                // Found live, 2026-10-28: STT_GNU_IFUNC's st_value is the
+                // RESOLVER function's offset, not the real implementation
+                // -- e.g. this device's bionic libc.so resolves strcmp/
+                // strncmp this way (CPU-feature dispatch). Using st_value
+                // directly as a hookable/callable address is wrong: a
+                // caller's own GOT/PLT entry gets bound to whatever the
+                // resolver RETURNS (resolved once by the dynamic linker),
+                // so hooking/calling the resolver's own address never
+                // intercepts real callers at all -- confirmed live:
+                // Interceptor.replace() on the naive offset "worked" only
+                // because the test called that exact same (wrong) address
+                // itself; strcmp('hello','hello') called that way returned
+                // a stray pointer-sized constant, not 0.
+                //
+                // Fix: actually run the resolver (this IS what the dynamic
+                // linker itself does at bind time, in this same process/
+                // address space, so it's safe) and use what it returns.
+                typedef void* (*ifunc_resolver_t)(void);
+                ifunc_resolver_t resolver = (ifunc_resolver_t)((uint8_t*)base_addr + symtab[i].st_value);
+                void* real_impl = resolver();
+                if (real_impl) {
+                    exp->offset = (uintptr_t)real_impl - (uintptr_t)base_addr;
+                } else {
+                    exp->offset = symtab[i].st_value; // resolver gave nothing usable, fall back
+                }
+            } else {
+                exp->offset = symtab[i].st_value;
+            }
 
             result->count++;
         }
@@ -642,10 +671,18 @@ elf_exports_t* get_symbols(const char* lib_name) {
 
     result->count = 0;
 
+    // Same IFUNC fix as get_exports() above -- needs the library's LIVE
+    // base to actually run a resolver, which this (file-only, for the
+    // full .symtab) function didn't otherwise need. NULL is fine: the
+    // library just isn't loaded in this process yet, so IFUNC symbols
+    // fall back to their (wrong, but at least non-crashing) raw offset,
+    // same as before this fix.
+    void* live_base = find_library_base(lib_name);
+
     for (size_t i = 0; i < sym_count; i++) {
         unsigned char type = ELF64_ST_TYPE(symtab[i].st_info);
 
-        if ((type == STT_FUNC || type == STT_OBJECT || type == STT_NOTYPE || type == STT_GNU_IFUNC) && 
+        if ((type == STT_FUNC || type == STT_OBJECT || type == STT_NOTYPE || type == STT_GNU_IFUNC) &&
             symtab[i].st_value != 0 &&
             symtab[i].st_shndx != SHN_UNDEF) {
             elf_export_t* exp = &result->exports[result->count];
@@ -655,7 +692,15 @@ elf_exports_t* get_symbols(const char* lib_name) {
 
             strncpy(exp->name, name, sizeof(exp->name) - 1);
             exp->name[sizeof(exp->name) - 1] = '\0';
-            exp->offset = symtab[i].st_value;
+
+            if (type == STT_GNU_IFUNC && live_base) {
+                typedef void* (*ifunc_resolver_t)(void);
+                ifunc_resolver_t resolver = (ifunc_resolver_t)((uint8_t*)live_base + symtab[i].st_value);
+                void* real_impl = resolver();
+                exp->offset = real_impl ? ((uintptr_t)real_impl - (uintptr_t)live_base) : symtab[i].st_value;
+            } else {
+                exp->offset = symtab[i].st_value;
+            }
 
             result->count++;
         }
