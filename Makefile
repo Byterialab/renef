@@ -102,7 +102,10 @@ SERVER_SRCS := src/server/main.cpp \
                src/librenef/cmd/cmd_hooks.cpp \
                src/librenef/cmd/cmd_sec.cpp \
                src/librenef/cmd/cmd_memdump.cpp \
+               src/librenef/cmd/cmd_memdump_passive.cpp \
                src/librenef/cmd/cmd_hookgen.cpp \
+               src/librenef/cmd/cmd_rpc.cpp \
+               src/librenef/cmd/cmd_events.cpp \
                src/librenef/cmd/cmd_strace.cpp \
                src/librenef/cmd/cmd_resume.cpp \
                src/librenef/cmd/cmd_ai.cpp \
@@ -154,8 +157,10 @@ PAYLOAD_LDFLAGS := -llog $(CAPSTONE_LIB) $(LUA_LIB) -lm -ldl
 AGENT_SRCS := src/agent/core/agent.c \
               src/agent/core/globals.c \
               src/agent/core/registry.c \
+              src/agent/core/output_queue.c \
               src/agent/hook/native.c \
               src/agent/hook/java.c \
+              src/agent/hook/java_jni.c \
               src/agent/proc/proc.c \
               src/agent/handlers/eval.c \
               src/agent/handlers/inspect.c \
@@ -411,13 +416,16 @@ CLIENT_ANDROID_SRCS := src/binr/renef/main.cpp \
                        src/librenef/cmd/cmd_hooks.cpp \
                        src/librenef/cmd/cmd_sec.cpp \
                        src/librenef/cmd/cmd_memdump.cpp \
+                       src/librenef/cmd/cmd_memdump_passive.cpp \
                        src/librenef/cmd/cmd_hookgen.cpp \
+                       src/librenef/cmd/cmd_rpc.cpp \
+                       src/librenef/cmd/cmd_events.cpp \
+                       src/librenef/cmd/cmd_mcp.cpp \
+                       src/librenef/mcp/mcp_client.cpp \
                        src/librenef/cmd/cmd_strace.cpp \
                        src/librenef/cmd/cmd_resume.cpp \
                        src/librenef/cmd/cmd_ai.cpp \
                        src/librenef/cmd/cmd_plugin.cpp \
-                       src/librenef/cmd/cmd_resume.cpp \
-                       src/librenef/cmd/cmd_ai.cpp \
                        src/librenef/transport/server.cpp \
                        src/librenef/transport/uds.cpp \
                        src/librenef/transport/tcp.cpp \
@@ -434,6 +442,7 @@ CLIENT_ANDROID_CXXFLAGS := -std=c++17 \
                            $(SERVER_OPT_FLAGS) \
                            -DRENEF_CLI_BUILD \
                            -DRENEF_NO_READLINE \
+                           -DRENEF_HAS_PLUGINS \
                            -Isrc/librenef/include \
                            -Isrc/librenef \
                            -Isrc/binr/renef/tui \

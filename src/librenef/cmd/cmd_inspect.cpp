@@ -1,5 +1,6 @@
 #include <renef/cmd.h>
 #include <renef/socket_helper.h>
+#include <renef/agent_request.h>
 #include <renef/string_utils.h>
 #include <cstdio>
 #include <string>
@@ -16,58 +17,64 @@ public:
     }
 
     std::string get_description() const override {
-        return "Install native hook at offset in library. Usage: hookn <lib_name> <offset>";
+        return "Hook a native function and log its calls. Usage: hookn <lib_name> <offset|symbol>";
     }
 
     CommandResult dispatch(int client_fd, const char* cmd_buffer, size_t cmd_size) override {
+        (void)cmd_size;
         int pid = CommandRegistry::instance().get_current_pid();
 
         if (pid <= 0) {
-            const char* error_msg = "ERROR: No target PID set. Please attach first.\n";
+            const char* error_msg = "ERROR: No target PID set. Please attach/spawn first.\n";
             write(client_fd, error_msg, strlen(error_msg));
             return CommandResult(false, "No target PID set");
         }
 
-        SocketHelper& socket_helper = CommandRegistry::instance().get_socket_helper();
-        int sock = socket_helper.ensure_connection(pid);
-
-        if (sock < 0) {
-            const char* error_msg = "ERROR: Failed to create socket\n";
-            write(client_fd, error_msg, strlen(error_msg));
-            return CommandResult(false, "Socket creation failed");
-        }
-
         std::vector<std::string> cmd_parts = split(cmd_buffer, ' ');
-
         if (cmd_parts.size() < 3) {
-            const char* error = "ERROR: Usage: ib <lib_name> <offset>\n";
+            const char* error = "ERROR: Usage: hookn <lib_name> <offset|symbol>\n";
             write(client_fd, error, strlen(error));
             return CommandResult(false, "Invalid arguments");
         }
 
-        std::string lib_name = cmd_parts[1];
-        std::string offset = cmd_parts[2];
-
-        std::string filter = extract_filter(cmd_buffer, cmd_size);
-        std::string command = build_agent_command("hook " + lib_name + " " + offset, filter);
-        socket_helper.send_data(command.c_str(), command.length());
-
-        char buffer[4096];
-        ssize_t n = socket_helper.receive_data(buffer, sizeof(buffer));
-
-        if (n > 0) {
-            write(client_fd, buffer, n);
-        } else if (n == 0) {
-            const char* msg = "ERROR: Agent disconnected\n";
-            write(client_fd, msg, strlen(msg));
-            return CommandResult(false, "Agent disconnected");
-        } else {
-            const char* msg = "ERROR: Failed to read from agent\n";
-            write(client_fd, msg, strlen(msg));
-            return CommandResult(false, "Failed to read from agent");
+        SocketHelper& socket_helper = CommandRegistry::instance().get_socket_helper();
+        if (socket_helper.ensure_connection(pid) < 0) {
+            const char* error_msg = "ERROR: Failed to connect to agent\n";
+            write(client_fd, error_msg, strlen(error_msg));
+            return CommandResult(false, "Socket connection failed");
         }
 
-        return CommandResult(true, "Inspect binary finished");
+        // The agent builds and runs the hook script itself (handlers/
+        // inspect.c). This used to send "hook ..." - a command the agent
+        // does not have - so hookn never did anything but report
+        // "Unknown command".
+        std::string reply;
+        renef_agent_request::Outcome outcome = renef_agent_request::run(
+            socket_helper, pid, "hookn " + cmd_parts[1] + " " + cmd_parts[2], 15000,
+            [&](const std::string& data) { reply += data; }, /*may_resume=*/false);
+        if (!outcome.sent || !outcome.done) {
+            std::string error = renef_agent_request::timeout_message("hookn", outcome, 15000);
+            write(client_fd, error.c_str(), error.size());
+            return CommandResult(false, "No response from agent");
+        }
+
+        // The script's status line is not part of this command's output.
+        std::string out;
+        bool failed = false;
+        size_t pos = 0;
+        while (pos < reply.size()) {
+            size_t eol = reply.find('\n', pos);
+            std::string line = reply.substr(pos, eol == std::string::npos ? std::string::npos : eol - pos);
+            pos = (eol == std::string::npos) ? reply.size() : eol + 1;
+            if (line == "OK") continue;
+            if (line == "ERROR: Lua execution failed") { failed = true; continue; }
+            if (line.compare(0, 13, "ERROR: hookn:") == 0) failed = true;
+            out += line + "\n";
+        }
+        if (failed && out.empty()) out = "ERROR: hookn failed\n";
+        write(client_fd, out.c_str(), out.size());
+
+        return CommandResult(!failed, failed ? "Hook failed" : "Hook installed");
     }
 };
 

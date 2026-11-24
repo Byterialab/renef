@@ -1,5 +1,6 @@
 #include <renef/cmd.h>
 #include <renef/socket_helper.h>
+#include <renef/agent_request.h>
 #include <cstdio>
 #include <string>
 #include <cstring>
@@ -62,6 +63,26 @@ static std::string format_memscan_response(const std::string& json_response) {
     return out.str();
 }
 
+namespace {
+
+// Runs the agent's scan and returns its JSON reply ("" if none arrived).
+std::string scan_request(SocketHelper& socket_helper, int pid, const std::string& hex_pattern) {
+    std::string response;
+    renef_agent_request::Outcome outcome = renef_agent_request::run(
+        socket_helper, pid, "ms " + hex_pattern, 120000,
+        [&](const std::string& data) { response += data; }, /*may_resume=*/false);
+    if (!outcome.sent || !outcome.done) {
+        return "";
+    }
+    size_t json_end = response.find("}\n");
+    if (json_end != std::string::npos) {
+        response.resize(json_end + 2);
+    }
+    return response;
+}
+
+} // namespace
+
 class MemScan : public CommandDispatcher {
 public:
     std::string get_name() const override {
@@ -102,56 +123,12 @@ public:
             hex_pattern.pop_back();
         }
 
-        std::string command = "ms " + hex_pattern + "\n";
-        socket_helper.send_data(command.c_str(), command.length());
-
-        int flags = fcntl(sock, F_GETFL, 0);
-        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-
-        char buffer[8192];
-        std::string response;
-        int timeout_count = 0;
-        const int max_timeout = 100;
-
-        while (timeout_count < max_timeout) {
-            struct pollfd pfd = {sock, POLLIN, 0};
-            int ret = poll(&pfd, 1, 100);
-
-            if (ret > 0 && (pfd.revents & POLLIN)) {
-                ssize_t n = recv(sock, buffer, sizeof(buffer) - 1, 0);
-                if (n > 0) {
-                    buffer[n] = '\0';
-                    response += buffer;
-
-                    size_t json_end = response.find("}\n");
-                    if (json_end != std::string::npos) {
-                        response = response.substr(0, json_end + 2);
-                        break;
-                    }
-                    timeout_count = 0;
-                } else if (n == 0) {
-                    break;
-                }
-            } else if (ret == 0) {
-                timeout_count++;
-            } else {
-                break;
-            }
-        }
-
-        char drain_buffer[1024];
-        while (true) {
-            struct pollfd pfd = {sock, POLLIN, 0};
-            int ret = poll(&pfd, 1, 10);
-            if (ret > 0 && (pfd.revents & POLLIN)) {
-                ssize_t n = recv(sock, drain_buffer, sizeof(drain_buffer), 0);
-                if (n <= 0) break;
-            } else {
-                break;
-            }
-        }
-
-        fcntl(sock, F_SETFL, flags);
+        // A scan of a large app takes several seconds. As a framed request
+        // the reply is complete at the agent's marker however long it takes;
+        // the previous 10s wait gave up too early on big targets, and the
+        // scan's late reply was then read as the answer to the next command.
+        (void)sock;
+        std::string response = scan_request(socket_helper, pid, hex_pattern);
 
         if (!response.empty()) {
             std::string formatted = format_memscan_response(response);
@@ -205,56 +182,12 @@ public:
             hex_pattern.pop_back();
         }
 
-        std::string command = "ms " + hex_pattern + "\n";
-        socket_helper.send_data(command.c_str(), command.length());
-
-        int flags = fcntl(sock, F_GETFL, 0);
-        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-
-        char buffer[8192];
-        std::string response;
-        int timeout_count = 0;
-        const int max_timeout = 100;
-
-        while (timeout_count < max_timeout) {
-            struct pollfd pfd = {sock, POLLIN, 0};
-            int ret = poll(&pfd, 1, 100);
-
-            if (ret > 0 && (pfd.revents & POLLIN)) {
-                ssize_t n = recv(sock, buffer, sizeof(buffer) - 1, 0);
-                if (n > 0) {
-                    buffer[n] = '\0';
-                    response += buffer;
-
-                    size_t json_end = response.find("}\n");
-                    if (json_end != std::string::npos) {
-                        response = response.substr(0, json_end + 2);
-                        break;
-                    }
-                    timeout_count = 0;
-                } else if (n == 0) {
-                    break;
-                }
-            } else if (ret == 0) {
-                timeout_count++;
-            } else {
-                break;
-            }
-        }
-
-        char drain_buffer[1024];
-        while (true) {
-            struct pollfd pfd = {sock, POLLIN, 0};
-            int ret = poll(&pfd, 1, 10);
-            if (ret > 0 && (pfd.revents & POLLIN)) {
-                ssize_t n = recv(sock, drain_buffer, sizeof(drain_buffer), 0);
-                if (n <= 0) break;
-            } else {
-                break;
-            }
-        }
-
-        fcntl(sock, F_SETFL, flags);
+        // A scan of a large app takes several seconds. As a framed request
+        // the reply is complete at the agent's marker however long it takes;
+        // the previous 10s wait gave up too early on big targets, and the
+        // scan's late reply was then read as the answer to the next command.
+        (void)sock;
+        std::string response = scan_request(socket_helper, pid, hex_pattern);
 
         if (!response.empty()) {
             write(client_fd, response.c_str(), response.length());

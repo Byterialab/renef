@@ -3,9 +3,47 @@
 #include <renef/string_utils.h>
 #include <unistd.h>
 #include <cstring>
+#include <cerrno>
 #include <sstream>
 #include <iomanip>
 #include <capstone/capstone.h>
+#include <fcntl.h>
+#include <string>
+
+namespace {
+
+// Reads [address, address+size) of `pid` from /proc/<pid>/mem.
+// Returns 1 if all of it was read, 0 if the range is not (fully) mapped,
+// -1 if /proc/<pid>/mem cannot be used here (not root, SELinux, not Linux).
+//
+// This is the preferred source for `md`: the agent answers `md` with raw
+// bytes on the same socket that carries hook output, so with a hook that
+// prints while the dump is read the two got mixed - hook text came back as
+// "memory" and the real bytes stayed behind for the next command. Reading
+// here involves the agent not at all (no ptrace either), and also works for
+// execute-only code the target itself cannot read.
+int read_proc_mem(int pid, uintptr_t address, size_t size, char* out) {
+    std::string path = "/proc/" + std::to_string(pid) + "/mem";
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) return -1;
+    size_t total = 0;
+    bool unusable = false;
+    while (total < size) {
+        ssize_t n = pread(fd, out + total, size - total, (off_t)(address + total));
+        if (n <= 0) {
+            // EIO/EFAULT: nothing mapped there. Anything else at the very
+            // first read means this path does not work at all.
+            if (n < 0 && total == 0 && errno != EIO && errno != EFAULT) unusable = true;
+            break;
+        }
+        total += (size_t)n;
+    }
+    close(fd);
+    if (unusable) return -1;
+    return total == size ? 1 : 0;
+}
+
+} // namespace
 
 class MemDumpCommand : public CommandDispatcher {
 public:
@@ -66,21 +104,35 @@ public:
             return CommandResult(false, "No PID");
         }
 
+        char* buffer = new char[size + 256];
+        size_t total_received = 0;
+
+        int direct = read_proc_mem(pid, address, size, buffer);
+        if (direct == 0) {
+            delete[] buffer;
+            const char* error = "ERROR: Invalid memory address or access violation\n";
+            write(client_fd, error, strlen(error));
+            return CommandResult(false, "Memory access error");
+        }
+        if (direct == 1) {
+            total_received = size;
+        }
+
         SocketHelper& socket_helper = CommandRegistry::instance().get_socket_helper();
-        int sock = socket_helper.ensure_connection(pid);
+        int sock = direct == 1 ? 0 : socket_helper.ensure_connection(pid);
 
         if (sock < 0) {
+            delete[] buffer;
             const char* error = "ERROR: Failed to connect to agent\n";
             write(client_fd, error, strlen(error));
             return CommandResult(false, "Connection failed");
         }
 
+        if (direct != 1) {
+        // Fallback: ask the agent (unreliable while hooks print, see above).
         std::stringstream cmd;
         cmd << "md " << std::hex << address << " " << std::dec << size << "\n";
         socket_helper.send_data(cmd.str().c_str(), cmd.str().length());
-
-        char* buffer = new char[size + 256];
-        size_t total_received = 0;
 
         ssize_t first_read = socket_helper.receive_data(buffer, std::min(size_t(64), size));
         if (first_read <= 0) {
@@ -117,6 +169,7 @@ public:
 
             total_received += received;
         }
+        } // direct != 1
 
         size_t received_size = total_received;
 

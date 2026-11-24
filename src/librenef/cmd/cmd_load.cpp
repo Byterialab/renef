@@ -1,5 +1,6 @@
 #include <renef/cmd.h>
 #include <renef/socket_helper.h>
+#include <renef/agent_request.h>
 #include <renef/string_utils.h>
 #include <cstdio>
 #include <cstdlib>
@@ -70,50 +71,27 @@ public:
         }
 
         std::string hex = hex_encode(lua_script);
-        std::string command = "hexexec " + hex + "\n";
-        socket_helper.send_data(command.c_str(), command.length());
 
-        int gated = CommandRegistry::instance().gated_pid;
-        bool need_resume = (gated > 0 && gated == pid);
+        // Framed request. This used to wait for a
+        // completion marker the agent never sends, so every `l <script>`
+        // sat through a full 5s of silence before returning, and output
+        // arriving after that was read by the next command.
+        renef_agent_request::Outcome outcome = renef_agent_request::run(
+            socket_helper, pid, "hexexec " + hex,
+            renef_agent_request::DEFAULT_SILENCE_TIMEOUT_MS,
+            [&](const std::string& data) { write(client_fd, data.data(), data.size()); });
 
-        int flags = fcntl(sock, F_GETFL, 0);
-        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-
-        char buffer[4096];
-        bool script_done = false;
-        int timeout_count = 0;
-        const int max_timeout = 50;
-
-        while (!script_done && timeout_count < max_timeout) {
-            struct pollfd pfd = {sock, POLLIN, 0};
-            int ret = poll(&pfd, 1, 100);
-
-            if (ret > 0 && (pfd.revents & POLLIN)) {
-                ssize_t n = recv(sock, buffer, sizeof(buffer) - 1, 0);
-                if (n > 0) {
-                    buffer[n] = '\0';
-                    write(client_fd, buffer, n);
-                    if (strstr(buffer, "\342\234\223 Lua executed") || strstr(buffer, "\342\234\227 Lua")) {
-                        script_done = true;
-                    }
-                    timeout_count = 0;
-                } else if (n == 0) {
-                    break;
-                }
-            } else if (ret == 0) {
-                timeout_count++;
-            } else {
-                break;
-            }
+        if (!outcome.sent) {
+            const char* error_msg = "ERROR: Failed to send script to agent\n";
+            write(client_fd, error_msg, strlen(error_msg));
+            return CommandResult(false, "Send failed");
         }
-
-        if (need_resume) {
-            fprintf(stderr, "[spawn-gate] Script delivered, resuming (pid=%d)\n", gated);
-            ptrace_resume(gated);
-            CommandRegistry::instance().gated_pid = -1;
+        if (!outcome.done) {
+            std::string msg = renef_agent_request::timeout_message(
+                "script", outcome, renef_agent_request::DEFAULT_SILENCE_TIMEOUT_MS);
+            write(client_fd, msg.c_str(), msg.size());
+            return CommandResult(false, "Script did not complete");
         }
-
-        fcntl(sock, F_SETFL, flags);
         return CommandResult(true, "Script loaded and executed");
     }
 };

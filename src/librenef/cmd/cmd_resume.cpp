@@ -26,6 +26,7 @@ public:
 
     ptrace_resume(gated);
     CommandRegistry::instance().gated_pid = -1;
+    CommandRegistry::instance().gate_hold = false;
 
     char msg[128];
     snprintf(msg, sizeof(msg), "Resumed pid %d\n", gated);
