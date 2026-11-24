@@ -58,6 +58,12 @@ MODULE API:
   Module.list() -> prints loaded modules
   Module.exports("libc.so") -> table of {name=string, offset=integer}
   Module.symbols("libc.so") -> table of {name=string, offset=integer}
+  Module.findExportByName("libc.so", "pthread_*") -> table of {name, offset} matching a glob pattern (* and ? wildcards; no wildcard = exact match)
+  Module.disassemble(addr, count) -> table of {address, size, mnemonic, op_str, is_branch, is_call, is_jump} for `count` ARM64 instructions starting at `addr` (max 1024); raises a Lua error on a bad/unmapped address instead of crashing the process
+
+PROCESS API:
+  Process.enumerateRanges() -> table of {start, end, size, perms, path} for every /proc/self/maps region (unfiltered, includes anonymous/device mappings)
+  Process.enumerateThreads() -> table of integer thread IDs (typed equivalent of OS.listdir("/proc/self/task"))
 
 MEMORY API:
   Memory.read(addr, size) -> raw bytes string
@@ -91,6 +97,12 @@ THREAD API:
 GLOBALS:
   __hook_type__ = "trampoline" or "pltgot"  (set before hooks, default: trampoline)
   CYAN, GREEN, RED, YELLOW, BLUE, MAGENTA, RESET -> ANSI color strings
+
+STRUCTURED EVENTS:
+  send(table) -> emits "[event] <compact JSON>" as its own output line, SEPARATE from print()/console.log() text.
+  - Use send() for findings/results a pipeline should parse (e.g. send({type="key_found", algo="AES", key=hex})); use print() for human-readable log lines.
+  - Table encodes as a JSON array if it's a plain sequence (1..#t with no gaps), otherwise as a JSON object. Nested tables, strings, numbers, booleans, nil all supported; functions/userdata encode as null.
+  - Do not use this as a replacement for print() in every script -- only emit it for structured findings that are actually meant to be machine-parsed.
 
 === WORKING EXAMPLES ===
 
@@ -202,6 +214,24 @@ Syscall.trace("openat", {
         print("  -> fd=" .. info.retval)
     end
 })
+```
+
+EXAMPLE 8: Disassemble a function and report findings as a structured event
+```lua
+local addr = Module.find("liblog.so")
+if addr then
+    local exports = Module.exports("liblog.so")
+    for _, exp in ipairs(exports) do
+        if exp.name == "__android_log_print" then
+            local insns = Module.disassemble(addr + exp.offset, 8)
+            for _, insn in ipairs(insns) do
+                print(string.format("0x%x %s %s", insn.address, insn.mnemonic, insn.op_str))
+            end
+            send({type = "disassembly", function_name = exp.name, instruction_count = #insns})
+            break
+        end
+    end
+end
 ```
 
 === TOOL USAGE ===
