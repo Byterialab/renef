@@ -1,97 +1,81 @@
-# Frida_Labs challenges solved with Renef
+# Frida_Labs examples for Renef
 
-DERE-ad2001's [Frida_Labs](https://github.com/DERE-ad2001/Frida-labs) is a nice
-series of eleven Android challenges for learning instrumentation. This folder
-has a Renef Lua script for each one, worked the same way the original solutions
-do it — hook a method, call a method, patch an instruction — only with Renef's
-API instead of Frida's.
+These are the eleven Frida_Labs challenges, translated from the Frida solutions
+to Renef Lua. I worked through them one at a time on a rooted ARM64 phone and
+kept whichever script actually produced the flag — not the one that looked like
+it should work. All eleven passed twice in a row through the little harness in
+`tests/` (gitignored, so it stays on this machine).
 
-Every script was run on a rooted ARM64 device until it produced the challenge
-flag, twice in a row. They were driven through the Renef agent directly, so they
-work the same from the CLI or from any tooling that talks to the agent.
-
-## Running them
-
-Install the APKs from the Frida_Labs repository first. Then, from the renef
-CLI:
+Running one is usually just two calls:
 
 ```
-spawn com.ad2001.frida0x4
-l scripts/examples/frida_labs/challenge_0x4.lua
+renef_spawn("com.ad2001.frida0x4")
+renef_load_script(".../challenge_0x4.lua")
 ```
 
-Some challenges want a button press or a number typed into the app afterwards —
-each bullet below says which.
+The first load resumes the gated process, so there is no separate resume step.
+A few of them need a button press or a second submit; the write-up says which.
 
-## The challenges
+## What's in here
 
 - **0x1** — hook `check(II)V` and read the random number out of `args[2]`. The
-  obvious hook on `get_random()` doesn't fire because ART inlines that tiny
-  static method into `check`. Submit any number, then the one the hook prints.
-  Flag: `FRIDA{BABY_HOOK_0x1}`.
+  original hooks `get_random()`, but that method is tiny and gets inlined, so
+  the hook never fires. Submit any number, then the one the hook prints.
+  Result: `FRIDA{BABY_HOOK_0x1}` in the TextView.
 
-- **0x2** — `get_flag(4919)` is never called. Call it on the main thread: the
-  script registers a `Runnable` with `Java.registerClass` and posts it through a
-  `Handler`, because doing Android UI work from the agent thread hangs.
-  Flag: `FLAG{BABY_HOOKS_0x2}`.
+- **0x2** — call `get_flag(4919)`. Calling it from the agent thread hangs, so the
+  script posts a Runnable to the main looper with `Java.registerClass` and
+  `Handler.post`. Result: `FLAG{BABY_HOOKS_0x2}`.
 
 - **0x3** — `Checker.code` needs to reach 512. Renef can't write static fields,
-  so the script calls `increase()` 256 times, then you press the button.
-  Flag: `FRIDA{INJECT_AND_INSPECT}`.
+  so we call `increase()` 256 times and press Click me. Result:
+  `FRIDA{INJECT_AND_INSPECT}`.
 
-- **0x4** — build a `Check` object with `:new("()V")` and call
-  `get_flag(1337)`. The flag comes back as the return value.
-  Flag: `FRIDA{XORED_INSTANCE}`.
+- **0x4** — create a `Check` instance with `:new("()V")` and call
+  `get_flag(1337)`. Result: `FLAG FRIDA{XORED_INSTANCE}` in the MCP output; this
+  one never changes the UI.
 
-- **0x5**, **0x6**, **0x7** — the instance challenges. There is no
-  `Java.choose`, so we walk `ActivityThread.mActivities` with reflection, find
-  the live `MainActivity`, and invoke the target method on it. 0x6 and 0x7 also
-  build a `Checker` (with reflection-set fields, or the two-argument
-  constructor) and pass it in.
-  Flags: `FRIDA{ON_MATCH_THIS_INSTANCE}`, `FRIDA{INSTANCES_AND_INSTANCES}`,
+- **0x5**, **0x6**, **0x7** — these are the instance challenges. There is no
+  `Java.choose` in Renef, so we walk `ActivityThread.mActivities` with reflection,
+  find the live `MainActivity`, and invoke the method ourselves. 0x6 and 0x7
+  also build a `Checker` and set its numbers (or use the two-arg constructor).
+  Results: `FRIDA{ON_MATCH_THIS_INSTANCE}`, `FRIDA{INSTANCES_AND_INSTANCES}`,
   `FRIDA{HOOKING_CONSTRUCTORS}`.
 
-- **0x8** — a native hook on `cmpstr` at `libfrida0x8.so+0x864`, forced to
-  return 1. The library is loaded on the first Submit, and the hook is deferred
-  until then. A screenshot confirmed the toast.
-  Flag: your input, shown as `YEY YOU GOT THE FLAG ...`.
+- **0x8** — a deferred native hook on `cmpstr` at `libfrida0x8.so+0x864`, forcing
+  the return to 1. Android's translate popup sometimes eats the first tap, so
+  click Submit twice if needed. Verified by the hook output and a screenshot:
+  `YEY YOU GOT THE FLAG candidate`.
 
-- **0x9** — the same idea for `check_flag` at `liba0x9.so+0x614`, returning
-  1337 (this overlaps with the existing `dere_0x9.lua` example, which is where
-  the pattern came from).
-  Toast: `You won FRIDA{NATIVE_LAND_0x2}`.
+- **0x9** — same idea for `check_flag` at `liba0x9.so+0x614`, returning 1337.
+  Screenshot: `You won FRIDA{NATIVE_LAND_0x2}`.
 
-- **0xA** — the flag comes from a native `get_flag(int,int)` that is never
-  called, and Renef has no `NativeFunction` to call it with. Instead the script
-  patches the entry of `stringFromJNI` — which the app does call — with
-  `mov w0,#1`, `mov w1,#2` and a branch to `get_flag`. logcat then shows
+- **0xA** — call the uncalled native `get_flag(int,int)` directly with Renef's
+  `NativeFunction` (added in 0.4.0). On older agents the fallback is a
+  hand-encoded ARM64 patch of `stringFromJNI`'s entry. logcat then shows
   `Decrypted Flag: FRIDA{DONT_CALL_ME}`.
 
-- **0xB** — NOP the `b.ne` at `libfrida0xb.so+0x15248` so execution falls
-  through into the decoder. Click the button once to load the library, load the
-  script, click again. logcat: `FRIDA{NATIVE_HACKER}`.
+- **0xB** — NOP the `b.ne` at `libfrida0xb.so+0x15248`. Click once to get the
+  library loaded, load the script, click again. logcat shows
+  `FRIDA{NATIVE_HACKER}`.
 
-`_prelude.lua` is the classloader snippet the Java scripts need. It is inlined
-in each script because the Lua sandbox has no `require()`.
+Each challenge has a `Solution_0xN.md` next to its script, written the same way
+the Frida_Labs solutions are: what the app does, what the decompilation shows,
+how the Frida version solves it, and how we do it in Renef.
 
-## Things learned while writing these
+`_prelude.lua` is the app-classloader snippet the Java scripts need. It is
+inlined in each script because Renef Lua has no `require()`.
 
-- Java class names use slashes and hooks need the full JNI signature.
-- `Java.use()` can't see app classes until the agent thread's context
-  classloader is pointed at the Application's classloader — that is what
-  `_prelude.lua` does.
-- Don't call a Java method from inside a hook handler; re-entering a method
-  from its own `onEnter` crashed the agent.
-- ART inlines small static methods, so a hook on them may never fire — hook the
-  caller instead.
-- If a class or library loads on the first user interaction, interact once
-  before hooking it.
-- Native return overrides work when the app calls the function, but do not
-  always propagate when Lua calls the same function through JNI directly.
+## Things I learned the hard way
 
-## Verification note
-
-Verified against the 0.3.x agent on a rooted ARM64 device (OnePlus CPH2487,
-Android 16). The scripts only use core APIs (`hook`, `Module`, `Memory`,
-`Java`), but they have not been re-run against the 0.4.0 agent yet — happy to
-re-verify before merge if that would help.
+- Java class names use slashes and need the full JNI signature.
+- `Java.use()` cannot see app classes until you give the agent thread the app's
+  classloader. That is what the prelude does.
+- Don't call a Java method from inside a hook handler. Re-entering `check()` from
+  its own `onEnter` crashed the agent.
+- Native return overrides work when the app calls the function, but not always
+  when Lua calls it through JNI directly. Verify against the app's behaviour,
+  not just the hook print.
+- If a class is loaded on the first click, click once before loading the script.
+- Toasts don't show up in `uiautomator dump` or logcat. For 0x8 and 0x9 I took a
+  screenshot and read it instead of guessing from a passing hook.
