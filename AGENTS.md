@@ -86,7 +86,7 @@ The authoritative full API (every function, args, return values) lives in
 | `NativeFunction` | `api_hook.c` | global — `NativeFunction(addr[, retType[, argTypes]])` calls native code from Lua (≤8 int/ptr args, x0-x7); also reaches a hooked original via the reentrancy guard |
 | `Memory`  | `api_memory.c`    | `search`, `scan`, `dump`, `read`, `write`, `patch`, `alloc`, `allocStr`, `free`, `protect`, `readU8/16/32/64`, `writeU8/16/32/64`, `readStr`/`readString`, `hexdump` (+ global `hexdump`) |
 | `Module`  | `engine.c`        | `list`, `find`, `exports`, `symbols` |
-| `Java`    | `api_java.c`      | `use`, `registerClass`, `array`; wrapper `:new`/`:call`; instance `:call` + `.raw` |
+| `Java`    | `api_java.c`      | `use`, `registerClass`, `array`, `enumerateLoadedClasses`, `methodInfo`; wrapper `:new`/`:call`; instance `:call` + `.raw` |
 | `JNI`     | `engine.c`        | type-tag helpers: `string`, `int`, `long`, `boolean` |
 | `Jni`     | `api_jni.c`       | raw JNI: `newStringUTF`, `getStringUTF`, `getStringLength`, `deleteGlobalRef` (note: lowercase, distinct from `JNI`) |
 | `Thread`  | `api_thread.c`    | `backtrace` (PAC-aware), `id` |
