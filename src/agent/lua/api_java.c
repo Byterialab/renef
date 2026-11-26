@@ -873,6 +873,130 @@ static int lua_java_array(lua_State* L) {
 
 // Java.use("com.example.Class") -> JavaClassWrapper userdata
 //=============================================================================
+// Java.methodInfo(method)                       method: a java.lang.reflect
+// Java.methodInfo(class, name, signature)       Method / Constructor object
+//=============================================================================
+//
+// What ART holds for one method, as a table:
+//   method   address of the ArtMethod record
+//   flags    its access flags (ART's, not only the Java modifiers)
+//   entry    entry point of its compiled code - or of the interpreter's
+//            entry code when the method has none. For a method renef has
+//            hooked this is the entry point it had before.
+//   jni      for a native method: the function a call ends up in
+//   bound    for a native method: false while no function is bound to it
+//            (jni is then ART's lookup stub); absent when that cannot be
+//            told on this Android version
+//   native, static, hooked   booleans
+//
+// With a reflection object the class is not initialised (FromReflectedMethod
+// only unwraps the object). The three-string form looks the method up with
+// GetMethodID, and that runs the class's static initialiser if it has not
+// run yet - which for a class of native methods usually loads its library.
+static int lua_java_method_info(lua_State* L) {
+    JNIEnv* env = get_jni_env();
+    if (!env) {
+        lua_pushnil(L);
+        lua_pushstring(L, "Failed to get JNIEnv");
+        return 2;
+    }
+    const ArtMethodOffsets* off = get_art_method_offsets();
+    if (!off || off->art_method_size == 0) {
+        lua_pushnil(L);
+        lua_pushstring(L, "unknown ArtMethod layout on this Android version");
+        return 2;
+    }
+
+    jclass clazz = NULL;
+    jmethodID mid = NULL;
+    const char* why = NULL;
+
+    jobject* reflected = (jobject*)luaL_testudata(L, 1, JAVA_INSTANCE_MT);
+    if (reflected && *reflected) {
+        mid = (*env)->FromReflectedMethod(env, *reflected);
+        jclass member_class = (*env)->GetObjectClass(env, *reflected);
+        jmethodID declaring = member_class
+            ? (*env)->GetMethodID(env, member_class, "getDeclaringClass", "()Ljava/lang/Class;") : NULL;
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        if (mid && declaring) {
+            clazz = (jclass)(*env)->CallObjectMethod(env, *reflected, declaring);
+            if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        }
+        if (member_class) (*env)->DeleteLocalRef(env, member_class);
+        if (!mid || !clazz) why = "not a java.lang.reflect.Method or Constructor";
+    } else {
+        const char* class_name = luaL_checkstring(L, 1);
+        const char* method = luaL_checkstring(L, 2);
+        const char* sig = luaL_checkstring(L, 3);
+        char path[MAX_CLASS_NAME];
+        size_t n = strlen(class_name);
+        if (n >= sizeof(path)) n = sizeof(path) - 1;
+        for (size_t i = 0; i < n; i++) path[i] = class_name[i] == '.' ? '/' : class_name[i];
+        path[n] = '\0';
+        clazz = find_class(env, path);
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        if (!clazz) {
+            why = "class not found";
+        } else {
+            mid = (*env)->GetMethodID(env, clazz, method, sig);
+            if (!mid) {
+                (*env)->ExceptionClear(env);
+                mid = (*env)->GetStaticMethodID(env, clazz, method, sig);
+                if (!mid) (*env)->ExceptionClear(env);
+            }
+            if (!mid) why = "method not found";
+        }
+    }
+
+    void* art = (mid && clazz) ? jmethodid_to_art_method(env, mid, clazz) : NULL;
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    if (clazz) (*env)->DeleteLocalRef(env, clazz);
+    if (!art) {
+        lua_pushnil(L);
+        lua_pushstring(L, why ? why : "cannot find the method record");
+        return 2;
+    }
+
+    uint32_t flags = *(uint32_t*)((uintptr_t)art + off->access_flags_offset);
+    void* entry = *(void**)((uintptr_t)art + off->entry_point_offset);
+    void* data = *(void**)((uintptr_t)art + off->entry_point_offset - sizeof(void*));
+    bool hooked = false;
+    for (int i = 0; i < g_java_hook_count; i++) {
+        if (g_java_hooks[i].is_hooked && g_java_hooks[i].art_method == art) {
+            hooked = true;
+            flags = g_java_hooks[i].original_access_flags;
+            if (g_java_hooks[i].original_entry_point) entry = g_java_hooks[i].original_entry_point;
+            break;
+        }
+    }
+    bool is_native = (flags & 0x0100) != 0;      /* kAccNative */
+
+    lua_newtable(L);
+    lua_pushinteger(L, (lua_Integer)(uintptr_t)art);
+    lua_setfield(L, -2, "method");
+    lua_pushinteger(L, (lua_Integer)flags);
+    lua_setfield(L, -2, "flags");
+    lua_pushinteger(L, (lua_Integer)(uintptr_t)entry);
+    lua_setfield(L, -2, "entry");
+    if (is_native) {
+        lua_pushinteger(L, (lua_Integer)(uintptr_t)data);
+        lua_setfield(L, -2, "jni");
+        void* unbound = java_jni_unbound_stub(env);
+        if (unbound) {
+            lua_pushboolean(L, data != unbound);
+            lua_setfield(L, -2, "bound");
+        }
+    }
+    lua_pushboolean(L, is_native);
+    lua_setfield(L, -2, "native");
+    lua_pushboolean(L, (flags & 0x0008) != 0);   /* kAccStatic */
+    lua_setfield(L, -2, "static");
+    lua_pushboolean(L, hooked);
+    lua_setfield(L, -2, "hooked");
+    return 1;
+}
+
+//=============================================================================
 // Java.enumerateLoadedClasses()
 //=============================================================================
 //
@@ -1313,6 +1437,9 @@ void lua_register_java(lua_State* L) {
 
     lua_pushcfunction(L, lua_java_enumerate_loaded_classes);
     lua_setfield(L, -2, "enumerateLoadedClasses");
+
+    lua_pushcfunction(L, lua_java_method_info);
+    lua_setfield(L, -2, "methodInfo");
 
     lua_setglobal(L, "Java");
 

@@ -110,6 +110,13 @@ void* java_libart_symbol(const char* name);
 // on this thread (it becomes retval.value). Takes ownership of `text`.
 void java_hook_set_return_string(char* text);
 
+// Returns and clears the ready-made local JNI reference (if any) that
+// java_hook_on_leave() stashed on this thread for the return value it just
+// produced, so jj_dispatch() can hand it straight back instead of rebuilding
+// it from a raw pointer via raw_ptr_to_jni_ref(). NULL if onLeave didn't
+// produce one (e.g. no replacement, or a replacement given as a raw address).
+jobject java_hook_take_return_object(void);
+
 // Whether the onEnter callback that just ran on this thread asked for the
 // original to be skipped (args.skip = true). Per thread: the flag in
 // JavaHookInfo is shared by every thread that is inside the hook.
@@ -131,6 +138,9 @@ int java_jni_install(JNIEnv* env, jclass clazz, jmethodID method_id, void* art_m
                      bool is_static, const char* class_name, const char* method_name,
                      const char* signature, int onEnter_ref, int onLeave_ref);
 int java_jni_uninstall(int hook_index);
+// What the JNI slot of a native method holds while no function is bound
+// to it (ART's lookup stub), or NULL when that cannot be told here.
+void* java_jni_unbound_stub(JNIEnv* env);
 
 #ifdef __cplusplus
 }

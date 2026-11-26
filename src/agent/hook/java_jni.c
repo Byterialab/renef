@@ -161,6 +161,7 @@ static int g_init_state = 0;            /* 0 not tried, 1 ready, -1 unavailable 
 static void* g_slots[JJ_SLOTS];
 static void* g_generic_jni_entry = NULL;
 static void* g_interpreter_bridge = NULL;
+static void* g_unbound_jni = NULL;
 static unsigned char* g_stub_page = NULL;
 #define JJ_CODE_PER_HOOK 48     /* JNI stub (24 bytes) + entry point code (24 bytes) */
 #define JJ_CODE_BYTES ((size_t)MAX_JAVA_HOOKS * JJ_CODE_PER_HOOK)
@@ -255,6 +256,7 @@ static int jj_init(JNIEnv* env) {
         "(Ljava/lang/Object;FJDILjava/lang/Object;FJDICSBZLjava/lang/Object;FJDI)J",
     };
     void* probe_entry[2] = { NULL, NULL };
+    void* probe_data[2] = { NULL, NULL };
     uint32_t probe_flags[2] = { 0, 0 };
     for (int i = 0; i < 2; i++) {
         jmethodID mid = (*env)->GetMethodID(env, slots, probe_names[i], probe_sigs[i]);
@@ -265,6 +267,7 @@ static int jj_init(JNIEnv* env) {
             return -1;
         }
         probe_entry[i] = *(void**)((uintptr_t)art + off->entry_point_offset);
+        probe_data[i] = *(void**)((uintptr_t)art + data_offset(off));
         probe_flags[i] = *(uint32_t*)((uintptr_t)art + off->access_flags_offset);
     }
     if (!probe_entry[0] || probe_entry[0] != probe_entry[1] ||
@@ -274,6 +277,10 @@ static int jj_init(JNIEnv* env) {
         return -1;
     }
     g_generic_jni_entry = probe_entry[0];
+    /* Nobody registered a function for the probes, so what their JNI slot
+     * holds is ART's "look the symbol up on the first call" stub: the mark
+     * of a native method that is not bound to its function yet. */
+    g_unbound_jni = (probe_data[0] == probe_data[1]) ? probe_data[0] : NULL;
     LOGI("generic JNI entry %p (a plain slot has %p)", g_generic_jni_entry,
          *(void**)((uintptr_t)g_slots[0] + off->entry_point_offset));
 
@@ -618,6 +625,7 @@ void jj_dispatch(uint64_t hook_index, uint64_t* regs, uint64_t* stack_args, uint
     }
 
     uint64_t after = java_hook_on_leave((int)hook_index, raw);
+    jobject replacement_obj = java_hook_take_return_object();
 
     switch (sig->ret) {
         case 'V': break;
@@ -625,8 +633,12 @@ void jj_dispatch(uint64_t hook_index, uint64_t* regs, uint64_t* stack_args, uint
             result[1] = after;
             break;
         case 'L':
-            result[0] = (after == raw) ? (uint64_t)(uintptr_t)robj
-                                       : (uint64_t)(uintptr_t)as_jobject(env, after);
+            if (replacement_obj) {
+                result[0] = (uint64_t)(uintptr_t)replacement_obj;
+            } else {
+                result[0] = (after == raw) ? (uint64_t)(uintptr_t)robj
+                                           : (uint64_t)(uintptr_t)as_jobject(env, after);
+            }
             break;
         case 'Z': result[0] = (after != 0); break;
         default:  result[0] = after; break;
@@ -794,6 +806,12 @@ int java_jni_install(JNIEnv* env, jclass clazz, jmethodID method_id, void* art_m
          index, class_name, method_name, signature, art_method, flags, target_flags,
          jj->orig_entry, jj->entry, twin, twin_flags, backup, backup_entry);
     return index;
+}
+
+void* java_jni_unbound_stub(JNIEnv* env) {
+    if (get_android_api_level() < 31 || !env) return NULL;
+    if (jj_init(env) != 1) return NULL;
+    return g_unbound_jni;
 }
 
 int java_jni_uninstall(int hook_index) {

@@ -16,6 +16,12 @@
 #include <elf.h>
 #include <fcntl.h>
 
+// Not in the NDK's elf.h; standard GNU extension tag, same value on every
+// toolchain (glibc, bionic, LLVM, binutils).
+#ifndef DT_GNU_HASH
+#define DT_GNU_HASH 0x6ffffef5
+#endif
+
 JavaHookInfo g_java_hooks[MAX_JAVA_HOOKS];
 int g_java_hook_count = 0;
 
@@ -660,6 +666,33 @@ void* jni_ref_to_raw_ptr(JNIEnv* env, jobject ref) {
 }
 
 // Resolve a dynamic symbol from the in-memory ELF image (no file I/O, SELinux-safe)
+// One past the highest dynamic symbol index reachable through a DT_GNU_HASH
+// table - what DT_HASH's header would have given directly as its symbol
+// count, which DT_GNU_HASH does not store anywhere. API 23+ system
+// libraries (including libart.so) are built with --hash-style=gnu only, so
+// DT_HASH is normally absent and this is the only reliable way to bound a
+// linear scan of .dynsym.
+static uint32_t gnu_hash_symbol_count(const uint32_t* gnu_hash) {
+    uint32_t nbuckets = gnu_hash[0];
+    uint32_t symoffset = gnu_hash[1];
+    uint32_t bloom_size = gnu_hash[2];
+    const uint32_t* buckets = (const uint32_t*)((const uint8_t*)gnu_hash + 16 + (size_t)bloom_size * 8);
+    const uint32_t* chain = buckets + nbuckets;
+
+    uint32_t max_index = 0;
+    for (uint32_t b = 0; b < nbuckets; b++) {
+        uint32_t idx = buckets[b];
+        if (idx == 0) continue;
+        while (1) {
+            uint32_t h = chain[idx - symoffset];
+            if (idx > max_index) max_index = idx;
+            if (h & 1) break; // low bit set: end of this bucket's chain
+            idx++;
+        }
+    }
+    return max_index ? max_index + 1 : 0;
+}
+
 static void* find_symbol_in_mapped_elf(uintptr_t base, const char* symbol_name) {
     Elf64_Ehdr* ehdr = (Elf64_Ehdr*)base;
     if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) {
@@ -704,6 +737,7 @@ static void* find_symbol_in_mapped_elf(uintptr_t base, const char* symbol_name) 
     Elf64_Sym* symtab = NULL;
     const char* strtab = NULL;
     uint32_t nchain = 0;
+    uint32_t* gnu_hash = NULL;
 
     for (Elf64_Dyn* d = dynamic; d->d_tag != DT_NULL; d++) {
         if (d->d_tag == DT_SYMTAB)
@@ -713,6 +747,8 @@ static void* find_symbol_in_mapped_elf(uintptr_t base, const char* symbol_name) 
         else if (d->d_tag == DT_HASH) {
             uint32_t* h = (uint32_t*)(dyn_bias + d->d_un.d_ptr);
             nchain = h[1];
+        } else if (d->d_tag == DT_GNU_HASH) {
+            gnu_hash = (uint32_t*)(dyn_bias + d->d_un.d_ptr);
         }
     }
 
@@ -721,13 +757,22 @@ static void* find_symbol_in_mapped_elf(uintptr_t base, const char* symbol_name) 
         return NULL;
     }
 
+    // API 23+ system libraries (libart.so included) are built with
+    // --hash-style=gnu only, so DT_HASH - and the chain count it would have
+    // given directly - is normally absent. The previous fallback guessed the
+    // symbol count from the byte gap between symtab and strtab; on a layout
+    // where they aren't adjacent that silently produced a count far larger
+    // than the real table, walking the loop below into unrelated, often
+    // non-readable pages and crashing strcmp() on a garbage pointer
+    // (SEGV_ACCERR) - exactly the Xiaomi/Android 16 libagent.so crash this
+    // function was rewritten to fix.
+    if (nchain == 0 && gnu_hash) {
+        nchain = gnu_hash_symbol_count(gnu_hash);
+    }
+
     if (nchain == 0) {
-        uintptr_t sym_start = (uintptr_t)symtab;
-        uintptr_t str_start = (uintptr_t)strtab;
-        if (str_start > sym_start)
-            nchain = (str_start - sym_start) / sizeof(Elf64_Sym);
-        if (nchain == 0 || nchain > 100000)
-            nchain = 10000;
+        LOGW("ELF(mem): no DT_HASH or DT_GNU_HASH, cannot safely size the symbol table");
+        return NULL;
     }
 
     LOGI("ELF(mem): symtab=%p strtab=%p nchain=%u, searching for %s",
@@ -751,7 +796,7 @@ static void* find_symbol_in_mapped_elf(uintptr_t base, const char* symbol_name) 
 
 typedef jobject (*CreateLocalRef_t)(void* self, void* obj);
 static CreateLocalRef_t g_create_local_ref = NULL;
-static int g_create_local_ref_init_tried = 0;
+static pthread_once_t g_create_local_ref_once = PTHREAD_ONCE_INIT;
 static int g_create_local_ref_is_env = 0;
 
 static const char* thread_symbols[] = {
@@ -799,10 +844,7 @@ static void try_resolve_elf(const char** syms, int is_env, const char* path, uin
     }
 }
 
-static void init_create_local_ref(void) {
-    if (g_create_local_ref_init_tried) return;
-    g_create_local_ref_init_tried = 1;
-
+static void init_create_local_ref_once(void) {
     // Try dlsym first (Thread symbols, then JNIEnvExt symbols)
     void* handle = dlopen("libart.so", RTLD_NOW | RTLD_NOLOAD);
     if (handle) {
@@ -879,6 +921,16 @@ static void init_create_local_ref(void) {
     if (!g_create_local_ref) {
         LOGW("CreateLocalRef not found - raw_ptr_to_jni_ref will not work");
     }
+}
+
+// Resolves and caches g_create_local_ref. Several threads can reach this on
+// their very first call into a hook whose callback replaces an object/String
+// value (any hooked method can be called concurrently from multiple ART
+// threads) - pthread_once makes every caller but the first block until the
+// one-time dlsym/ELF-parsing work above has actually finished, instead of
+// racing through it together.
+static void init_create_local_ref(void) {
+    pthread_once(&g_create_local_ref_once, init_create_local_ref_once);
 }
 
 typedef jobject (*IRT_Add_t)(void* table, uint32_t cookie, void* obj);
@@ -1573,6 +1625,23 @@ bool java_hook_skip_requested(void) {
     return g_tls_skip_original;
 }
 
+// A ready-made local JNI reference for the onLeave return value that just
+// ran on this thread, when onLeave produced its replacement through a
+// higher-level helper (currently JNI.string) that already holds a valid
+// jobject. Handing that reference straight back avoids a needless round
+// trip through raw_ptr_to_jni_ref()/CreateLocalRef(), whose ART-internal
+// symbol lookup is version-fragile and unresolved on some builds (e.g.
+// Android 16). jj_dispatch() consumes (and clears) this once per call,
+// regardless of the return type, so a stale value can't leak into the
+// next hook invocation on this thread.
+static __thread jobject g_tls_return_object = NULL;
+
+jobject java_hook_take_return_object(void) {
+    jobject obj = g_tls_return_object;
+    g_tls_return_object = NULL;
+    return obj;
+}
+
 void java_hook_abandon_call(void) {
     if (g_hook_call_stack.depth > 0) {
         g_hook_call_stack.depth--;
@@ -1740,6 +1809,7 @@ uint64_t java_hook_on_leave(int hook_index, uint64_t ret_val) {
                                         void* raw_ptr = jni_ref_to_raw_ptr(env, new_str);
                                         if (raw_ptr) {
                                             ret_val = (uint64_t)raw_ptr;
+                                            g_tls_return_object = new_str;
                                             LOGI("  Modified to jstring: \"%s\" (jni_ref=%p, raw_ptr=%p)",
                                                  str_value, new_str, raw_ptr);
                                         } else {
