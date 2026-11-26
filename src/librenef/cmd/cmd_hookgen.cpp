@@ -1,5 +1,7 @@
 #include <renef/cmd.h>
 #include <renef/socket_helper.h>
+#include <cinttypes>
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <unistd.h>
@@ -48,9 +50,9 @@ public:
         char lib_name[256];
         uint64_t offset;
 
-        if (sscanf(args, "%255s %lx", lib_name, &offset) == 2) {
+        if (sscanf(args, "%255s %" SCNx64, lib_name, &offset) == 2) {
             char offset_str[32];
-            snprintf(offset_str, sizeof(offset_str), "0x%lx", offset);
+            snprintf(offset_str, sizeof(offset_str), "0x%" PRIx64, offset);
             std::string template_code = generate_hook_template(lib_name, offset_str);
             write(client_fd, template_code.c_str(), template_code.length());
             return CommandResult(true, "Template generated");
